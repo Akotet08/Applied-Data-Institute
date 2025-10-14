@@ -1,5 +1,4 @@
-# ADI Data for Impact - Fusion 4
-# Dashboard Project
+# Dashboard Project - Fusion 4
 
 ## Overview
 [Brief description of your project]
@@ -13,8 +12,8 @@
 
 1. Clone the repository:
 ```bash
-git clone https://github.com/Akotet08/().git
-cd Fusion_4_Dashboard
+git clone https://github.com/Akotet08/Applied-Data-Institute.git
+cd Applied-Data-Institute
 ```
 
 2. Create and activate virtual environment:
