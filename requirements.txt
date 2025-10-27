@@ -1,26 +1,4 @@
 streamlit
-streamlit-option-menu
-
-# Core Data Science
-numpy
-pandas
-scipy
-scikit-learn
-statsmodels
-
-
-# Data Visualization
-matplotlib
-seaborn
 plotly
-bokeh
-
-
-# Dashboard & Web
-streamlit
-
-# Interactive Computing
-jupyter
-jupyterlab
-notebook
-ipywidgets
+folium>=0.15
+streamlit-folium>=0.20
