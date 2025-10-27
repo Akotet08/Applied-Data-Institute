@@ -1,0 +1,4 @@
+streamlit
+plotly
+folium>=0.15
+streamlit-folium>=0.20

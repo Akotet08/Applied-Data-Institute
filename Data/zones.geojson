@@ -1,0 +1,69 @@
+{
+  "type": "FeatureCollection",
+  "features": [
+    {
+      "type": "Feature",
+      "properties": {"id": "c", "name": "Central", "safeAccess": 81},
+      "geometry": {
+        "type": "Polygon",
+        "coordinates": [[[36.7, -1.05], [36.9, -1.05], [36.9, -0.85], [36.7, -0.85], [36.7, -1.05]]]
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": {"id": "n", "name": "North", "safeAccess": 58},
+      "geometry": {
+        "type": "Polygon",
+        "coordinates": [[[36.7, -0.85], [36.9, -0.85], [36.9, -0.65], [36.7, -0.65], [36.7, -0.85]]]
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": {"id": "s", "name": "South", "safeAccess": 66},
+      "geometry": {
+        "type": "Polygon",
+        "coordinates": [[[36.7, -1.25], [36.9, -1.25], [36.9, -1.05], [36.7, -1.05], [36.7, -1.25]]]
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": {"id": "e", "name": "East", "safeAccess": 74},
+      "geometry": {
+        "type": "Polygon",
+        "coordinates": [[[36.9, -1.05], [37.1, -1.05], [37.1, -0.85], [36.9, -0.85], [36.9, -1.05]]]
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": {"id": "w", "name": "West", "safeAccess": 49},
+      "geometry": {
+        "type": "Polygon",
+        "coordinates": [[[36.5, -1.05], [36.7, -1.05], [36.7, -0.85], [36.5, -0.85], [36.5, -1.05]]]
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": {"id": "ne", "name": "North-East", "safeAccess": 71},
+      "geometry": {
+        "type": "Polygon",
+        "coordinates": [[[36.9, -0.85], [37.1, -0.85], [37.1, -0.65], [36.9, -0.65], [36.9, -0.85]]]
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": {"id": "nw", "name": "North-West", "safeAccess": 55},
+      "geometry": {
+        "type": "Polygon",
+        "coordinates": [[[36.5, -0.85], [36.7, -0.85], [36.7, -0.65], [36.5, -0.65], [36.5, -0.85]]]
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": {"id": "se", "name": "South-East", "safeAccess": 63},
+      "geometry": {
+        "type": "Polygon",
+        "coordinates": [[[36.9, -1.25], [37.1, -1.25], [37.1, -1.05], [36.9, -1.05], [36.9, -1.25]]]
+      }
+    }
+  ]
+}
