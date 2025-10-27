@@ -218,9 +218,7 @@ def _scene_page_path(scene_key: str) -> Optional[str]:
         "access": "pages/2_🗺️_Access_&_Coverage.py",
         "quality": "pages/3_🛠️_Service_Quality_&_Reliability.py",
         "finance": "pages/4_💹_Financial_Health.py",
-        "sanitation": "pages/5_♻️_Sanitation_&_Reuse_Chain.py",
-        "governance": "pages/6_🏛️_Governance_&_Compliance.py",
-        "sector": "pages/7_🌍_Sector_&_Environment.py",
+        "production": "pages/5_♻️_Production.py",
     }
     return mapping.get(scene_key)
 
@@ -272,7 +270,7 @@ def scene_executive(go_to):
 
     # Second row gauges
     row2 = [
-        {"label": "Asset Health Index", "value": es["asset_health_idx"], "target": 80, "scene": "governance"},
+        {"label": "Asset Health Index", "value": es["asset_health_idx"], "target": 80, "scene": "finance"},
         {"label": "Hours of Supply", "value": es["hours_per_day"], "target": 22, "scene": "quality"},
         {"label": "DWQ", "value": es["dwq_pct"], "target": 95, "scene": "quality"},
     ]
@@ -989,12 +987,14 @@ def render_uhn_dashboard():
         ("access", "Access & Coverage"),
         ("quality", "Service Quality & Reliability"),
         ("finance", "Financial Health"),
-        ("sanitation", "Sanitation & Reuse Chain"),
-        ("governance", "Governance & Compliance"),
-        ("sector", "Sector & Environment"),
+        ("production", "Production"),
     ]
 
+    valid_scene_keys = {key for key, _ in scene_labels}
     active = st.session_state.get("active_scene", "exec")
+    if active not in valid_scene_keys:
+        active = "exec"
+        st.session_state["active_scene"] = active
     cols = st.columns(len(scene_labels))
     for (key, label), col in zip(scene_labels, cols):
         with col:
@@ -1005,8 +1005,9 @@ def render_uhn_dashboard():
                 st.rerun()
 
     def go_to(scene_key: str):
-        st.session_state["active_scene"] = scene_key
-        st.rerun()
+        if scene_key in valid_scene_keys:
+            st.session_state["active_scene"] = scene_key
+            st.rerun()
 
     # Render active scene
     if active == "exec":
@@ -1019,10 +1020,6 @@ def render_uhn_dashboard():
         scene_finance()
     elif active == "production":
         scene_production()
-    elif active == "governance":
-        scene_governance()
-    elif active == "sector":
-        scene_sector()
     else:
         scene_executive(go_to)
 
@@ -1065,10 +1062,6 @@ def render_scene_page(scene_key: str):
         scene_finance()
     elif scene_key == "production":
         scene_production()
-    elif scene_key == "governance":
-        scene_governance()
-    elif scene_key == "sector":
-        scene_sector()
     else:
         scene_executive(lambda key: None)
     st.markdown("</div>", unsafe_allow_html=True)
@@ -1196,16 +1189,3 @@ def _render_zone_map_overlay(
         nm = str(popup_text).replace("<b>", "").replace("</b>", "")
         return nm
     return None
-
-
-
-if __name__ == "__main__":
-    dic = load_csv_data()
-    sewer  = dic.get("sewer", [])
-    water = dic.get("water", [])
-
-    print("Sewer data sample:")
-    sewer.head()
-
-    print("Water data sample:")
-    water.head()
