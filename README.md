@@ -54,3 +54,12 @@ streamlit run dashboard/Home.py
 
 ## License
 [Your chosen license]
+
+
+# Pages -> Function
+To edit pages, update the fuction in `uhn_dashboard.py`
+
+1. 2_🗺️_Access_&_Coverage.py: `scene_access`
+2. 3_🛠️_Service_Quality_&_Reliability.py: `scene_quality`
+3. 4_💹_Financial_Health.py: `scene_finance`
+4. 5_♻️_Production.py: `scene_production`
