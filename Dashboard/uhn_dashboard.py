@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import io
+import os
+import re
 from dataclasses import dataclass
 from typing import List, Optional, Tuple, Dict, Any
 import json
@@ -217,9 +219,7 @@ def _scene_page_path(scene_key: str) -> Optional[str]:
         "access": "pages/2_🗺️_Access_&_Coverage.py",
         "quality": "pages/3_🛠️_Service_Quality_&_Reliability.py",
         "finance": "pages/4_💹_Financial_Health.py",
-        "sanitation": "pages/5_♻️_Sanitation_&_Reuse_Chain.py",
-        "governance": "pages/6_🏛️_Governance_&_Compliance.py",
-        "sector": "pages/7_🌍_Sector_&_Environment.py",
+        "production": "pages/5_♻️_Production.py",
     }
     return mapping.get(scene_key)
 
@@ -271,7 +271,7 @@ def scene_executive(go_to):
 
     # Second row gauges
     row2 = [
-        {"label": "Asset Health Index", "value": es["asset_health_idx"], "target": 80, "scene": "governance"},
+        {"label": "Asset Health Index", "value": es["asset_health_idx"], "target": 80, "scene": "finance"},
         {"label": "Hours of Supply", "value": es["hours_per_day"], "target": 22, "scene": "quality"},
         {"label": "DWQ", "value": es["dwq_pct"], "target": 95, "scene": "quality"},
     ]
@@ -329,7 +329,190 @@ def scene_executive(go_to):
         _download_button("recent-activity.csv", recent)
         st.table(pd.DataFrame(recent))
         st.markdown("</div>", unsafe_allow_html=True)
+@st.cache_data
+def load_csv_data() -> Dict[str, pd.DataFrame]:
+    """
+    Read sewer and water access CSV datasets from disk and cache the resulting DataFrames.
+    """
+    csv_map = {
+        "sewer": "Sewer Access Data.csv",
+        "water": "Water Access Data.csv",
+    }
+    frames: Dict[str, pd.DataFrame] = {}
+    for key, filename in csv_map.items():
+        path = DATA_DIR / filename
+        if not path.exists():
+            raise FileNotFoundError(f"File not found: {path}")
+        frames[key] = pd.read_csv(path)
+    return frames
 
+
+def _normalise_access_df(df: pd.DataFrame, *, prefix: str, extra_pct_cols: Optional[List[str]] = None) -> pd.DataFrame:
+    """
+    Clean up access data: trim text, coerce numeric percentage columns, and ensure year is numeric.
+    """
+    frame = df.copy()
+    if "zone" in frame.columns:
+        frame["zone"] = frame["zone"].astype(str).str.strip()
+    if "country" in frame.columns:
+        frame["country"] = frame["country"].astype(str).str.strip()
+    if "year" in frame.columns:
+        frame["year"] = pd.to_numeric(frame["year"], errors="coerce").astype("Int64")
+    pct_cols = [col for col in frame.columns if col.startswith(prefix) and col.endswith("_pct")]
+    if extra_pct_cols:
+        pct_cols.extend(col for col in extra_pct_cols if col in frame.columns)
+    for col in pct_cols:
+        frame[col] = pd.to_numeric(frame[col], errors="coerce")
+    return frame
+
+
+def _latest_snapshot(
+    df: pd.DataFrame,
+    *,
+    rename_map: Dict[str, str],
+    additional_columns: Optional[List[str]] = None,
+) -> pd.DataFrame:
+    """
+    Return the most recent record per (country, zone) pair and rename columns for clarity.
+    """
+    keys = [col for col in ("country", "zone") if col in df.columns]
+    if not keys:
+        keys = ["zone"]
+    if "year" in df.columns:
+        idx = df.groupby(keys)["year"].idxmax()
+        latest = df.loc[idx].copy()
+    else:
+        latest = df.drop_duplicates(keys, keep="last").copy()
+    keep_cols = set(keys + ["year"] + list(rename_map.keys()))
+    if additional_columns:
+        keep_cols.update(additional_columns)
+    available_cols = [col for col in keep_cols if col in latest.columns]
+    latest = latest[available_cols]
+    latest = latest.rename(columns=rename_map)
+    return latest
+
+
+def _zone_identifier(country: Optional[str], zone: Optional[str]) -> str:
+    base = f"{country or 'na'}-{zone or 'zone'}".lower()
+    return re.sub(r"[^a-z0-9]+", "-", base).strip("-") or "zone"
+
+
+@st.cache_data
+def _prepare_service_data() -> Dict[str, Any]:
+    """
+    Prepare service quality data for visualization.
+    Returns a dictionary containing processed service data including:
+    - Full service data DataFrame
+    - Latest snapshots by zone
+    - Aggregated time series for key metrics
+    """
+    # Load service data
+    service_path = DATA_DIR / "Service_data.csv"
+    if not service_path.exists():
+        raise FileNotFoundError(f"Service data file not found: {service_path}")
+    
+    df = pd.read_csv(service_path)
+    
+    # Clean and process data
+    # Convert month and year to datetime
+    df['date'] = pd.to_datetime(df['year'].astype(str) + '-' + df['month'].astype(str).str.zfill(2) + '-01')
+    df = df.sort_values('date')
+    
+    # Calculate derived metrics
+    df['water_quality_rate'] = ((df['test_passed_chlorine'] / df['tests_conducted_chlorine'] * 100 +
+                                df['tests_passed_ecoli'] / df['test_conducted_ecoli'] * 100) / 2)
+    df['complaint_resolution_rate'] = (df['resolved'] / df['complaints'] * 100)
+    df['nrw_rate'] = ((df['w_supplied'] - df['total_consumption']) / df['w_supplied'] * 100)
+    df['sewer_coverage_rate'] = (df['sewer_connections'] / df['households'] * 100)
+    
+    # Get latest snapshot
+    latest_by_zone = df.sort_values('date').groupby(['country', 'city', 'zone']).last().reset_index()
+    
+    # Aggregate time series
+    time_series = df.groupby('date').agg({
+        'w_supplied': 'sum',
+        'total_consumption': 'sum',
+        'metered': 'sum',
+        'water_quality_rate': 'mean',
+        'complaint_resolution_rate': 'mean',
+        'nrw_rate': 'mean',
+        'sewer_coverage_rate': 'mean',
+        'public_toilets': 'sum'
+    }).reset_index()
+    
+    return {
+        "full_data": df,
+        "latest_by_zone": latest_by_zone,
+        "time_series": time_series,
+        "zones": sorted(df['zone'].unique()),
+        "cities": sorted(df['city'].unique()),
+        "countries": sorted(df['country'].unique())
+    }
+
+def _prepare_access_data() -> Dict[str, Any]:
+    """
+    Prepare derived access datasets for the Access & Coverage scene.
+    Returns cached water/sewer snapshots, full histories, and zone-level summaries.
+    """
+    csv_data = load_csv_data()
+    water_df = _normalise_access_df(csv_data["water"], prefix="w_", extra_pct_cols=["municipal_coverage"])
+    sewer_df = _normalise_access_df(csv_data["sewer"], prefix="s_")
+
+    water_latest = _latest_snapshot(
+        water_df,
+        rename_map={
+            "year": "water_year",
+            "w_safely_managed_pct": "water_safely_pct",
+            "w_basic_pct": "water_basic_pct",
+            "w_limited_pct": "water_limited_pct",
+            "w_unimproved_pct": "water_unimproved_pct",
+            "surface_water_pct": "water_surface_pct",
+            "municipal_coverage": "water_municipal_coverage",
+        },
+        additional_columns=["municipal_coverage", "w_safely_managed", "w_basic", "w_limited", "w_unimproved", "surface_water"],
+    )
+    sewer_latest = _latest_snapshot(
+        sewer_df,
+        rename_map={
+            "year": "sewer_year",
+            "s_safely_managed_pct": "sewer_safely_pct",
+            "s_basic_pct": "sewer_basic_pct",
+            "s_limited_pct": "sewer_limited_pct",
+            "s_unimproved_pct": "sewer_unimproved_pct",
+            "open_def_pct": "sewer_open_def_pct",
+        },
+        additional_columns=["s_safely_managed", "s_basic", "s_limited", "s_unimproved", "open_def"],
+    )
+
+    merge_keys = [col for col in ("country", "zone") if col in water_latest.columns and col in sewer_latest.columns]
+    if not merge_keys:
+        merge_keys = ["zone"]
+    zones_df = water_latest.merge(sewer_latest, on=merge_keys, how="outer", suffixes=("", "_dup"))
+    if "country_dup" in zones_df.columns and "country" not in merge_keys:
+        zones_df["country"] = zones_df["country"].fillna(zones_df["country_dup"])
+        zones_df = zones_df.drop(columns=["country_dup"])
+    zones_df["safeAccess"] = zones_df[["water_safely_pct", "sewer_safely_pct"]].mean(axis=1, skipna=True)
+    zone_records: List[Dict[str, Any]] = []
+    for _, row in zones_df.sort_values(by=[col for col in ("country", "zone") if col in zones_df.columns]).iterrows():
+        record = {
+            "id": _zone_identifier(row.get("country"), row.get("zone")),
+            "name": row.get("zone"),
+            "country": row.get("country"),
+            "safeAccess": float(row["safeAccess"]) if pd.notna(row.get("safeAccess")) else None,
+            "water_safely_pct": float(row["water_safely_pct"]) if pd.notna(row.get("water_safely_pct")) else None,
+            "sewer_safely_pct": float(row["sewer_safely_pct"]) if pd.notna(row.get("sewer_safely_pct")) else None,
+            "water_year": int(row["water_year"]) if pd.notna(row.get("water_year")) else None,
+            "sewer_year": int(row["sewer_year"]) if pd.notna(row.get("sewer_year")) else None,
+        }
+        zone_records.append(record)
+
+    return {
+        "water_full": water_df,
+        "sewer_full": sewer_df,
+        "water_latest": water_latest,
+        "sewer_latest": sewer_latest,
+        "zones": zone_records,
+    }
 
 def load_csv_data() -> Dict[str, pd.DataFrame]:
     """
@@ -885,155 +1068,675 @@ def scene_access():
     st.markdown("</div>", unsafe_allow_html=True)
 
 def scene_quality():
-    # Zone filter
-    # rely on sidebar zone
-
-    l, r = st.columns(2)
-    with l:
-        st.markdown("<div class='panel'><h3>Water Quality Compliance</h3>", unsafe_allow_html=True)
-        sq = _load_json("service_quality.json") or None
-        if sq:
-            df = pd.DataFrame({"m": sq["months"], "v": sq["dwq_pct"]})
+    # Load and process service data
+    service_data = _prepare_service_data()
+    df = service_data["full_data"]
+    
+    # Add filters in a clean layout with better styling
+    st.markdown("""
+        <div class='panel' style='margin-bottom: 20px'>
+            <h3 style='font-family: Inter, ui-sans-serif; margin-bottom: 15px; color: #0f172a'>
+                Service Area Filter
+            </h3>
+        </div>
+    """, unsafe_allow_html=True)
+    
+    filter_cols = st.columns([1, 1, 1])
+    
+    with filter_cols[0]:
+        countries = ['All'] + service_data["countries"]
+        selected_country = st.selectbox(
+            'Country',
+            countries,
+            key='quality_country',
+            help="Filter data by country"
+        )
+        
+    with filter_cols[1]:
+        if selected_country != 'All':
+            cities = ['All'] + sorted(df[df['country'] == selected_country]['city'].unique().tolist())
         else:
-            df = pd.DataFrame(WQ_MONTHLY)
-        df = _filter_df_by_months(df, "m")
-        target = 95
-        fig = px.line(df, x="m", y="v")
-        fig.add_hline(y=target, line_dash="dot", line_color="#ef4444")
-        fig.update_traces(mode="lines+markers")
-        st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False}, key="quality_wq_line")
-        below = df[df["v"] < target]["m"].tolist()
-        if below:
-            sel = st.selectbox("Below-target month", below, index=0)
-            st.info(f"Details for {sel}: DWQ {df.set_index('m').loc[sel, 'v']}% < target {target}% • Root cause placeholder • Actions placeholder")
-        st.markdown("</div>", unsafe_allow_html=True)
-    with r:
-        st.markdown("<div class='panel'><h3>Sewer Blockages</h3>", unsafe_allow_html=True)
-        unit_choice = st.session_state.get("blockage_basis", "per 100 km")
-        if sq and "blockages_per_100km" in sq and unit_choice == "per 100 km":
-            dfb = pd.DataFrame({"m": sq["months"], "v": sq["blockages_per_100km"]})
-        elif sq and unit_choice == "per 1000 connections" and "blockages_per_1000conn" in sq:
-            dfb = pd.DataFrame({"m": sq["months"], "v": sq["blockages_per_1000conn"]})
+            cities = ['All'] + service_data["cities"]
+        selected_city = st.selectbox(
+            'City',
+            cities,
+            key='quality_city',
+            help="Filter data by city"
+        )
+        
+    with filter_cols[2]:
+        if selected_city != 'All':
+            zones = ['All'] + sorted(df[df['city'] == selected_city]['zone'].unique().tolist())
         else:
-            dfb = pd.DataFrame(BLOCKAGES)
-            if unit_choice == "per 1000 connections":
-                st.caption("Data not available for per 1000 connections; showing per 100 km")
-        dfb = _filter_df_by_months(dfb, "m")
-        figb = px.bar(dfb, x="m", y="v", color_discrete_sequence=["#f59e0b"])
-        st.plotly_chart(figb, use_container_width=True, config={"displayModeBar": False}, key="quality_blockages")
-        st.markdown("</div>", unsafe_allow_html=True)
+            zones = ['All'] + service_data["zones"]
+        selected_zone = st.selectbox(
+            'Zone',
+            zones,
+            key='quality_zone',
+            help="Filter data by zone"
+        )
+    
+    # Apply filters to raw data
+    filtered_df = df.copy()
+    if selected_country != 'All':
+        filtered_df = filtered_df[filtered_df['country'] == selected_country]
+    if selected_city != 'All':
+        filtered_df = filtered_df[filtered_df['city'] == selected_city]
+    if selected_zone != 'All':
+        filtered_df = filtered_df[filtered_df['zone'] == selected_zone]
+    
+    # Add filter status indicator
+    filter_status = []
+    if selected_country != 'All':
+        filter_status.append(f"Country: {selected_country}")
+    if selected_city != 'All':
+        filter_status.append(f"City: {selected_city}")
+    if selected_zone != 'All':
+        filter_status.append(f"Zone: {selected_zone}")
+    if filter_status:
+        st.markdown(
+            f"""
+            <div style='background:#f0f9ff;border:1px solid #93c5fd;padding:8px 12px;border-radius:8px;margin:12px 0'>
+                <span style='font-weight:500'>Active Filters:</span> {' • '.join(filter_status)}
+            </div>
+            """,
+            unsafe_allow_html=True
+        )
+    
+    # Recalculate time series with filtered data
+    time_series = filtered_df.groupby('date').agg({
+        'w_supplied': 'sum',
+        'total_consumption': 'sum',
+        'metered': 'sum',
+        'water_quality_rate': 'mean',
+        'complaint_resolution_rate': 'mean',
+        'nrw_rate': 'mean',
+        'sewer_coverage_rate': 'mean',
+        'public_toilets': 'sum'
+    }).reset_index()
+    
+    # Calculate latest metrics for KPIs from filtered data
+    latest_data = filtered_df.sort_values('date').groupby(['country', 'city', 'zone']).last().reset_index()
+    
+    # Top KPI Section with improved styling
+    st.markdown("""
+        <div class='panel' style='margin-bottom: 20px'>
+            <h3 style='font-family: Inter, ui-sans-serif; margin-bottom: 15px; color: #0f172a'>
+                Key Performance Indicators
+            </h3>
+    """, unsafe_allow_html=True)
+    
+    # Calculate KPIs from filtered data
+    nrw = latest_data['nrw_rate'].mean()
+    water_quality = latest_data['water_quality_rate'].mean()
+    resolution_rate = latest_data['complaint_resolution_rate'].mean()
+    ww_treatment = latest_data['sewer_coverage_rate'].mean()  # Using sewer coverage as a proxy for treatment
+    
+    # KPI data with consistent styling
+    kpi_data = [
+        {
+            "label": "Non-Revenue Water",
+            "value": nrw,
+            "target": 25,
+            "color": "#ef4444" if nrw > 25 else "#10b981",
+            "icon": "💧"
+        },
+        {
+            "label": "Water Quality",
+            "value": water_quality,
+            "target": 95,
+            "color": "#10b981" if water_quality >= 95 else "#f59e0b",
+            "icon": "🧪"
+        },
+        {
+            "label": "Wastewater Treatment",
+            "value": ww_treatment,
+            "target": 80,
+            "color": "#10b981" if ww_treatment >= 80 else "#f59e0b",
+            "icon": "♻️"
+        },
+        {
+            "label": "Complaint Resolution",
+            "value": resolution_rate,
+            "target": 90,
+            "color": "#10b981" if resolution_rate >= 90 else "#f59e0b",
+            "icon": "✅"
+        }
+    ]
+    
+    # Display KPIs in a grid
+    cols = st.columns(4)
+    for i, kpi in enumerate(kpi_data):
+        with cols[i]:
+            gauge_style = _conic_css(kpi["value"], kpi["color"])
+            st.markdown(
+                f"""
+                <div class='scorecard' style='font-family: Inter, ui-sans-serif'>
+                    <div style='display: flex; align-items: center; margin-bottom: 8px'>
+                        <span style='font-size: 20px; margin-right: 8px'>{kpi['icon']}</span>
+                        <span style='font-size: 14px; font-weight: 600; color: #0f172a'>{kpi['label']}</span>
+                    </div>
+                    <div class='gauge-wrap'>
+                        <div class='gauge' style="{gauge_style}">
+                            <div class='gauge-inner' style='font-family: Inter, ui-sans-serif'>
+                                {kpi['value']:.1f}%
+                            </div>
+                        </div>
+                        <div class='meta' style='font-family: Inter, ui-sans-serif'>
+                            Target: {kpi['target']}%
+                        </div>
+                    </div>
+                </div>
+                """,
+                unsafe_allow_html=True
+            )
+    
+    st.markdown("</div>", unsafe_allow_html=True)
+    
+    # Charts Section - Full width plots using time series data
+    # Water Supply vs Consumption Chart
+    st.markdown("<div class='panel'><h3>Water Supply vs Consumption</h3>", unsafe_allow_html=True)
+    
+    # Use the filtered time series data
+    fig_supply = go.Figure()
+    fig_supply.add_trace(go.Scatter(x=time_series['date'], y=time_series['w_supplied'],
+                                  name='Water Supplied', mode='lines+markers',
+                                  line=dict(color='#0ea5e9', shape='linear')))
+    fig_supply.add_trace(go.Scatter(x=time_series['date'], y=time_series['total_consumption'],
+                                  name='Total Consumption', mode='lines+markers',
+                                  line=dict(color='#10b981', shape='linear')))
+    fig_supply.add_trace(go.Scatter(x=time_series['date'], y=time_series['metered'],
+                                  name='Metered Consumption', mode='lines+markers',
+                                  line=dict(color='#f59e0b', shape='linear')))
+    # Calculate dynamic y-axis range for supply chart
+    y_max = max(
+        time_series['w_supplied'].max(),
+        time_series['total_consumption'].max(),
+        time_series['metered'].max()
+    )
+    y_min = min(
+        time_series['w_supplied'].min(),
+        time_series['total_consumption'].min(),
+        time_series['metered'].min()
+    )
+    y_padding = (y_max - y_min) * 0.1
+    
+    fig_supply.update_layout(
+        margin=dict(l=10, r=10, t=10, b=10),
+        height=400,
+        showlegend=True,
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+        yaxis=dict(
+            range=[max(0, y_min - y_padding), y_max + y_padding],
+            title="Volume"
+        ),
+        xaxis=dict(title="Date")
+    )
+    st.plotly_chart(fig_supply, use_container_width=True, config={"displayModeBar": False})
+    st.markdown("</div>", unsafe_allow_html=True)
+    
+    # Water Quality Tests Chart
+    st.markdown("<div class='panel'><h3>Water Quality Tests</h3>", unsafe_allow_html=True)
+    fig_quality = go.Figure()
+    fig_quality.add_trace(go.Scatter(x=time_series['date'], 
+                                   y=time_series['water_quality_rate'],
+                                   name='Water Quality Rate',
+                                   mode='lines+markers',
+                                   line=dict(color='#10b981', shape='linear')))
+    target = 95
+    fig_quality.add_hline(y=target, line_dash="dot", 
+                        line_color="#ef4444",
+                        annotation_text="Target")
+    fig_quality.update_layout(
+        margin=dict(l=10, r=10, t=10, b=10),
+        height=400,
+        yaxis_range=[60, 100],
+        showlegend=True,
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
+    )
+    st.plotly_chart(fig_quality, use_container_width=True,
+                   config={"displayModeBar": False})
+    st.markdown("</div>", unsafe_allow_html=True)
 
-    st.markdown("<div class='panel'><h3>Hours & Consumption</h3>", unsafe_allow_html=True)
-    if sq:
-        dfh = pd.DataFrame({"m": sq["months"], "hours": sq["hours"], "lcd": sq.get("lcd", [])})
-        dfh = _filter_df_by_months(dfh, "m")
-        figh = go.Figure()
-        figh.add_trace(go.Scatter(x=dfh["m"], y=dfh["hours"], mode="lines", name="Hours/day", line=dict(color="#60a5fa", width=2)))
-        if len(dfh.get("lcd", [])) == len(dfh["m"]):
-            figh.add_trace(go.Scatter(x=dfh["m"], y=dfh["lcd"], mode="lines", name="l/c/d", yaxis="y2", line=dict(color="#10b981", width=2)))
-            figh.update_layout(yaxis2=dict(overlaying='y', side='right'))
-        st.plotly_chart(figh, use_container_width=True, config={"displayModeBar": False}, key="quality_hours_lcd")
-    else:
-        dfs = pd.DataFrame(COMPLAINTS_VS_INTERRUP)
-        figs = px.scatter(dfs, x="interruptions", y="complaints", hover_name="zone")
-        st.plotly_chart(figs, use_container_width=True, config={"displayModeBar": False}, key="quality_scatter")
+    # Customer Complaints Chart
+    st.markdown("<div class='panel'><h3>Customer Complaints</h3>", unsafe_allow_html=True)
+    complaint_resolution = time_series[['date', 'complaint_resolution_rate']].copy()
+    
+    fig_complaints = go.Figure()
+    fig_complaints.add_trace(go.Scatter(x=complaint_resolution['date'], 
+                                      y=complaint_resolution['complaint_resolution_rate'],
+                                      name='Resolution Rate',
+                                      mode='lines+markers',
+                                      line=dict(color='#0ea5e9', shape='linear')))
+    fig_complaints.update_layout(
+        barmode='overlay',
+        margin=dict(l=10, r=10, t=10, b=10),
+        height=400,
+        showlegend=True,
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
+    )
+    st.plotly_chart(fig_complaints, use_container_width=True, 
+                   config={"displayModeBar": False})
+    st.markdown("</div>", unsafe_allow_html=True)
+
+    # Sanitation Services Chart
+    st.markdown("<div class='panel'><h3>Sanitation Services</h3>", unsafe_allow_html=True)
+    # Use pre-calculated sewer coverage rate from time series
+    fig_sanitation = go.Figure()
+    fig_sanitation.add_trace(go.Scatter(x=time_series['date'],
+                                      y=time_series['sewer_coverage_rate'],
+                                      name='Sewer Coverage %',
+                                      mode='lines+markers',
+                                      line=dict(color='#10b981', shape='linear')))
+    fig_sanitation.add_trace(go.Bar(x=time_series['date'],
+                                  y=time_series['public_toilets'],
+                                  name='Public Toilets',
+                                  marker_color='#0ea5e9'))
+    fig_sanitation.update_layout(
+        margin=dict(l=10, r=10, t=10, b=10),
+        height=400,
+        showlegend=True,
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
+    )
+    st.plotly_chart(fig_sanitation, use_container_width=True,
+                   config={"displayModeBar": False})
     st.markdown("</div>", unsafe_allow_html=True)
 
 
 def scene_finance():
-    l, r = st.columns([7, 5])
-    with l:
-        st.markdown("<div class='panel'><h3>Revenue vs Opex + Coverage</h3>", unsafe_allow_html=True)
-        fin = _load_json("finance.json") or None
-        if fin and "months" in fin:
-            df = pd.DataFrame({"m": fin["months"], "revenue": fin["revenue"], "opex": fin["opex"]})
-            df = _filter_df_by_months(df, "m")
-            df["coverage"] = (df["revenue"] / df["opex"]).replace([float("inf"), -float("inf")], pd.NA) * 100
-            x = df["m"]
-        else:
-            df = pd.DataFrame(REVENUE_OPEX)
-            x = df["year"]
-        fig = go.Figure()
-        fig.add_bar(x=x, y=df["revenue"], name="Revenue", marker_color="#34d399")
-        fig.add_bar(x=x, y=df["opex"], name="Opex", marker_color="#f59e0b")
-        fig.add_trace(go.Scatter(x=x, y=df["coverage"], mode="lines", name="Coverage %", line=dict(color="#0ea5e9", width=2)))
-        fig.update_layout(barmode="group", margin=dict(l=10, r=10, t=10, b=10))
-        st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False}, key="finance_composed")
+    # Custom CSS
+    st.markdown("""
+    <style>
+        .panel {
+            background: white;
+            border-radius: 8px;
+            padding: 20px;
+            box-shadow: 0 1px 3px rgba(0,0,0,0.1);
+            margin-bottom: 20px;
+        }
+        .metric-card {
+            background: white;
+            border-radius: 8px;
+            padding: 20px;
+            box-shadow: 0 1px 3px rgba(0,0,0,0.1);
+            height: 100%;
+        }
+        .status-badge {
+            display: inline-block;
+            padding: 4px 8px;
+            border-radius: 12px;
+            font-size: 11px;
+            font-weight: 600;
+        }
+        .status-good { background: #d1fae5; color: #065f46; }
+        .status-warning { background: #fed7aa; color: #92400e; }
+        .status-critical { background: #fee2e2; color: #991b1b; }
+    </style>
+    """, unsafe_allow_html=True)
+
+    # Financial data structure
+    financial_data = {
+        "uganda": {
+            "staffCostAllocation": {
+                "staffCosts": 450000,
+                "totalBudget": 2100000,
+                "percentage": 21.4
+            },
+            "nrw": {
+                "percentage": 32,
+                "volumeLost": 2840000,
+                "estimatedRevenueLoss": 890000
+            },
+            "debt": {
+                "totalDebt": 1250000,
+                "collectionRate": 78,
+                "outstandingBills": 320000
+            },
+            "billing": {
+                "totalBilled": 1850000,
+                "collected": 1443000,
+                "efficiency": 78
+            }
+        }
+    }
+
+    # Production summary
+    production_summary = {
+        '2024': {
+            'victoria': {'total': 2645143, 'avgDaily': 7234},
+            'kyoga': {'total': 2583427, 'avgDaily': 7066}
+        },
+        '2023': {
+            'victoria': {'total': 2589428, 'avgDaily': 7093},
+            'kyoga': {'total': 2673284, 'avgDaily': 7324}
+        }
+    }
+
+    # Header
+    st.title("Water Utility Financial Dashboard - Uganda")
+    st.markdown("**Financial Plan & Billing KPIs | Sources: Victoria & Kyoga**")
+
+    # Warning banner
+    st.warning("⚠️ **Note:** Financial data shown is placeholder structure. Actual production data available: 2020-2024. Awaiting Lesotho billing data.")
+
+    # Year selector
+    selected_year = st.selectbox("Select Year", ['2024', '2023', '2022'], index=0)
+
+    st.markdown("---")
+
+    # KPI Cards
+    data = financial_data['uganda']
+    col1, col2, col3, col4 = st.columns(4)
+
+    with col1:
+        st.markdown("""
+        <div class='metric-card'>
+            <div style='display:flex;justify-content:space-between;align-items:center;margin-bottom:12px'>
+                <div style='background:#3b82f6;padding:12px;border-radius:8px'>
+                    <span style='color:white;font-size:20px'>💰</span>
+                </div>
+                <span class='status-badge status-good'>good</span>
+            </div>
+            <div style='color:#6b7280;font-size:12px;margin-bottom:4px'>Staff Cost Allocation</div>
+            <div style='font-size:24px;font-weight:bold;margin-bottom:4px'>{:.1f}%</div>
+            <div style='font-size:14px;color:#374151'>${:,.0f}K</div>
+            <div style='font-size:11px;color:#9ca3af;margin-top:4px'>of ${:,.0f}K</div>
+        </div>
+        """.format(
+            data['staffCostAllocation']['percentage'],
+            data['staffCostAllocation']['staffCosts'] / 1000,
+            data['staffCostAllocation']['totalBudget'] / 1000
+        ), unsafe_allow_html=True)
+
+    with col2:
+        st.markdown("""
+        <div class='metric-card'>
+            <div style='display:flex;justify-content:space-between;align-items:center;margin-bottom:12px'>
+                <div style='background:#f59e0b;padding:12px;border-radius:8px'>
+                    <span style='color:white;font-size:20px'>💧</span>
+                </div>
+                <span class='status-badge status-warning'>warning</span>
+            </div>
+            <div style='color:#6b7280;font-size:12px;margin-bottom:4px'>Non-Revenue Water</div>
+            <div style='font-size:24px;font-weight:bold;margin-bottom:4px'>{}%</div>
+            <div style='font-size:14px;color:#374151'>{:.2f}M m³</div>
+            <div style='font-size:11px;color:#9ca3af;margin-top:4px'>Loss: ${:,.0f}K</div>
+        </div>
+        """.format(
+            data['nrw']['percentage'],
+            data['nrw']['volumeLost'] / 1000000,
+            data['nrw']['estimatedRevenueLoss'] / 1000
+        ), unsafe_allow_html=True)
+
+    with col3:
+        st.markdown("""
+        <div class='metric-card'>
+            <div style='display:flex;justify-content:space-between;align-items:center;margin-bottom:12px'>
+                <div style='background:#10b981;padding:12px;border-radius:8px'>
+                    <span style='color:white;font-size:20px'>📈</span>
+                </div>
+                <span class='status-badge status-good'>good</span>
+            </div>
+            <div style='color:#6b7280;font-size:12px;margin-bottom:4px'>Collection Rate</div>
+            <div style='font-size:24px;font-weight:bold;margin-bottom:4px'>{}%</div>
+            <div style='font-size:14px;color:#374151'>${:,.0f}K</div>
+            <div style='font-size:11px;color:#9ca3af;margin-top:4px'>of ${:,.0f}K</div>
+        </div>
+        """.format(
+            data['billing']['efficiency'],
+            data['billing']['collected'] / 1000,
+            data['billing']['totalBilled'] / 1000
+        ), unsafe_allow_html=True)
+
+    with col4:
+        st.markdown("""
+        <div class='metric-card'>
+            <div style='display:flex;justify-content:space-between;align-items:center;margin-bottom:12px'>
+                <div style='background:#ef4444;padding:12px;border-radius:8px'>
+                    <span style='color:white;font-size:20px'>⚠️</span>
+                </div>
+                <span class='status-badge status-critical'>critical</span>
+            </div>
+            <div style='color:#6b7280;font-size:12px;margin-bottom:4px'>Outstanding Debt</div>
+            <div style='font-size:24px;font-weight:bold;margin-bottom:4px'>${:,.0f}K</div>
+            <div style='font-size:14px;color:#374151'>${:,.0f}K</div>
+            <div style='font-size:11px;color:#9ca3af;margin-top:4px'>Current unpaid bills</div>
+        </div>
+        """.format(
+            data['debt']['totalDebt'] / 1000,
+            data['debt']['outstandingBills'] / 1000
+        ), unsafe_allow_html=True)
+
+    st.markdown("---")
+
+    # Charts section
+    row1_col1, row1_col2 = st.columns(2)
+
+    # Budget Allocation Pie Chart
+    with row1_col1:
+        st.markdown("<div class='panel'><h3>Budget Allocation Breakdown</h3>", unsafe_allow_html=True)
+        
+        budget_data = pd.DataFrame([
+            {'category': 'Staff Costs', 'value': 21.4, 'amount': 450000},
+            {'category': 'Operations', 'value': 35.2, 'amount': 739200},
+            {'category': 'Maintenance', 'value': 18.5, 'amount': 388500},
+            {'category': 'Infrastructure', 'value': 15.3, 'amount': 321300},
+            {'category': 'Other', 'value': 9.6, 'amount': 201600}
+        ])
+        
+        colors = ['#3b82f6', '#10b981', '#f59e0b', '#ef4444', '#8b5cf6']
+        
+        fig1 = go.Figure(data=[go.Pie(
+            labels=budget_data['category'],
+            values=budget_data['value'],
+            marker=dict(colors=colors),
+            textinfo='label+percent',
+            textposition='outside',
+            hovertemplate='<b>%{label}</b><br>%{value}% ($%{customdata}K)<extra></extra>',
+            customdata=budget_data['amount'] / 1000
+        )])
+        
+        fig1.update_layout(
+            margin=dict(l=10, r=10, t=10, b=10),
+            height=350,
+            showlegend=False
+        )
+        
+        st.plotly_chart(fig1, use_container_width=True, config={'displayModeBar': False})
+        
+        st.markdown("""
+        <div style='border-top:1px solid #e5e7eb;padding-top:12px;margin-top:12px'>
+            <div style='display:flex;justify-content:space-between;font-size:13px'>
+                <span style='color:#6b7280'>Staff Cost Highlight:</span>
+                <span style='font-weight:600;color:#3b82f6'>21.4% - Within Acceptable Range</span>
+            </div>
+        </div>
+        """, unsafe_allow_html=True)
         st.markdown("</div>", unsafe_allow_html=True)
 
-    with r:
-        st.markdown("<div class='panel'><h3>NRW & Collection Efficiency</h3>", unsafe_allow_html=True)
-        if fin and "months" in fin:
-            dfl = pd.DataFrame({
-                "m": fin["months"],
-                "nrw": (pd.Series(fin["produced_m3"]) - pd.Series(fin["billed_m3"])) / pd.Series(fin["produced_m3"]) * 100,
-                "collection": (pd.Series(fin["revenue"]) / pd.Series(fin["billed"])) * 100 if "billed" in fin else pd.Series([pd.NA]*len(fin["months"]))
-            })
-            dfl = _filter_df_by_months(dfl, "m")
-            x2 = dfl["m"]
-        else:
-            dfl = pd.DataFrame(NRW_COLLECTION)
-            x2 = dfl["year"]
+    # NRW Trend Line Chart
+    with row1_col2:
+        st.markdown("<div class='panel'><h3>Non-Revenue Water Trend</h3>", unsafe_allow_html=True)
+        
+        nrw_data = pd.DataFrame([
+            {'month': 'Jan', 'nrw': 34, 'target': 25},
+            {'month': 'Feb', 'nrw': 33, 'target': 25},
+            {'month': 'Mar', 'nrw': 35, 'target': 25},
+            {'month': 'Apr', 'nrw': 32, 'target': 25},
+            {'month': 'May', 'nrw': 31, 'target': 25},
+            {'month': 'Jun', 'nrw': 32, 'target': 25}
+        ])
+        
         fig2 = go.Figure()
-        fig2.add_trace(go.Scatter(x=x2, y=dfl["nrw"], mode="lines", name="NRW %", line=dict(color="#ef4444", width=2)))
-        fig2.add_trace(go.Scatter(x=x2, y=dfl["collection"], mode="lines", name="Collection %", line=dict(color="#10b981", width=2)))
-        fig2.update_layout(margin=dict(l=10, r=10, t=10, b=10))
-        st.plotly_chart(fig2, use_container_width=True, config={"displayModeBar": False}, key="finance_dual_line")
+        fig2.add_trace(go.Scatter(
+            x=nrw_data['month'], y=nrw_data['nrw'],
+            mode='lines+markers',
+            name='Actual NRW',
+            line=dict(color='#f59e0b', width=3),
+            marker=dict(size=8)
+        ))
+        fig2.add_trace(go.Scatter(
+            x=nrw_data['month'], y=nrw_data['target'],
+            mode='lines',
+            name='Target',
+            line=dict(color='#10b981', width=2, dash='dash')
+        ))
+        
+        fig2.update_layout(
+            margin=dict(l=10, r=10, t=10, b=10),
+            height=350,
+            yaxis_title='NRW %',
+            xaxis_title='',
+            hovermode='x unified'
+        )
+        
+        st.plotly_chart(fig2, use_container_width=True, config={'displayModeBar': False})
+        
+        st.markdown("""
+        <div style='border-top:1px solid #e5e7eb;padding-top:12px;margin-top:12px'>
+            <div style='display:flex;justify-content:space-between;font-size:13px'>
+                <span style='color:#6b7280'>Current Status:</span>
+                <span style='font-weight:600;color:#f59e0b'>32% - Above 25% Target</span>
+            </div>
+        </div>
+        """, unsafe_allow_html=True)
         st.markdown("</div>", unsafe_allow_html=True)
 
-    zc, tc = st.columns([1, 1])
-    with zc:
-        st.markdown("<div class='panel'><h3>Zones</h3>", unsafe_allow_html=True)
-        if HAS_FOLIUM:
-            selected_name = _render_zone_map_overlay(
-                geojson_path="Data/zones.geojson",
-                id_property="id",
-                name_property="name",
-                metric_property="safeAccess",
-                key="zones_map_finance",
-            )
-            if selected_name:
-                st.session_state["selected_zone"] = next((z for z in ZONES if z["name"] == selected_name), None)
-        # reuse zone grid visual
-        cols = st.columns(2)
-        for i, z in enumerate(ZONES):
-            with cols[i % 2]:
-                color = "#10b981" if z["safeAccess"] >= 80 else ("#f59e0b" if z["safeAccess"] >= 60 else "#ef4444")
-                st.markdown(
-                    f"<div class='zonecard'><div style='display:flex;justify-content:space-between;align-items:center'><span style='font:600 12px Inter'>{z['name']}</span><span class='dot' style='background:{color}'></span></div><div style='height:8px;background:#f1f5f9;border-radius:6px;margin-top:8px'><div style='height:8px;width:{z['safeAccess']}%;background:{color};border-radius:6px'></div></div><div class='meta'>Safe access: {z['safeAccess']}%</div></div>",
-                    unsafe_allow_html=True,
-                )
+    # Second row of charts
+    row2_col1, row2_col2 = st.columns(2)
+
+    # Debt Aging Bar Chart
+    with row2_col1:
+        st.markdown("<div class='panel'><h3>Debt Aging Analysis</h3>", unsafe_allow_html=True)
+        
+        debt_data = pd.DataFrame([
+            {'category': '0-30 days', 'amount': 120000},
+            {'category': '31-60 days', 'amount': 85000},
+            {'category': '61-90 days', 'amount': 65000},
+            {'category': '90+ days', 'amount': 50000}
+        ])
+        
+        fig3 = go.Figure(data=[go.Bar(
+            x=debt_data['category'],
+            y=debt_data['amount'],
+            marker_color='#ef4444',
+            text=debt_data['amount'].apply(lambda x: f'${x/1000:.0f}K'),
+            textposition='outside',
+            hovertemplate='<b>%{x}</b><br>$%{y:,.0f}<extra></extra>'
+        )])
+        
+        fig3.update_layout(
+            margin=dict(l=10, r=10, t=10, b=10),
+            height=350,
+            yaxis_title='Amount ($)',
+            xaxis_title='',
+            showlegend=False
+        )
+        
+        st.plotly_chart(fig3, use_container_width=True, config={'displayModeBar': False})
+        
+        st.markdown("""
+        <div style='border-top:1px solid #e5e7eb;padding-top:12px;margin-top:12px'>
+            <div style='display:flex;justify-content:space-between;font-size:13px;margin-bottom:8px'>
+                <span style='color:#6b7280'>Total Outstanding:</span>
+                <span style='font-weight:600;color:#ef4444'>$320K</span>
+            </div>
+            <div style='display:flex;justify-content:space-between;font-size:13px'>
+                <span style='color:#6b7280'>Over 90 days:</span>
+                <span style='font-weight:600;color:#ef4444'>$50K (15.6%)</span>
+            </div>
+        </div>
+        """, unsafe_allow_html=True)
         st.markdown("</div>", unsafe_allow_html=True)
 
-    with tc:
-        st.markdown("<div class='panel'><h3>Key Financials</h3>", unsafe_allow_html=True)
-        zone_name = st.session_state.get("selected_zone", {}).get("name") if st.session_state.get("selected_zone") else "All"
-        if fin:
-            staff_eff = (fin.get("staff", 0) / max(1, fin.get("active_connections", 1))) * 1000
-            staff_cost_pct = (fin.get("staff_cost", 0) / max(1e-9, pd.Series(fin.get("opex", [])).mean())) * 100 if isinstance(fin.get("opex"), list) else fin.get("staff_cost", 0)
-            metered_pct = (fin.get("active_metered", 0) / max(1, fin.get("active_connections", 1))) * 100
-            rows = pd.DataFrame([
-                {"metric": "Staff efficiency (per 1k conns)", "value": round(staff_eff, 2)},
-                {"metric": "% Staff cost", "value": round(staff_cost_pct, 1)},
-                {"metric": "% Metered connections", "value": round(metered_pct, 1)},
-                {"metric": "% Utilisation of WTP", "value": round((fin.get("wtp", {}).get("used_mld", 0) / max(1, fin.get("wtp", {}).get("design_mld", 1))) * 100, 1)},
-                {"metric": "% Utilisation of STP", "value": round((fin.get("stp", {}).get("used_mld", 0) / max(1, fin.get("stp", {}).get("design_mld", 1))) * 100, 1)},
-                {"metric": "% Utilisation of FSTP", "value": round((fin.get("fstp", {}).get("used_tpd", 0) / max(1, fin.get("fstp", {}).get("design_tpd", 1))) * 100, 1)},
-                {"metric": "Pro-poor financing %", "value": fin.get("pro_poor_pct", 0)},
-                {"metric": "Budget variance % (actual/allocated)", "value": round((fin.get("budget", {}).get("actual", 0) / max(1, fin.get("budget", {}).get("allocated", 1))) * 100, 1)},
-            ])
-        else:
-            rows = pd.DataFrame(FINANCIALS_TABLE)
-        rows.insert(0, "zone", zone_name if zone_name and zone_name != "All zones" else "All")
-        st.table(rows)
-        data = rows.to_csv(index=False).encode("utf-8")
-        st.download_button("Export CSV", data=data, file_name="key-financials.csv")
+    # Billing & Collection Summary
+    with row2_col2:
+        st.markdown("<div class='panel'><h3>Billing & Collection Summary</h3>", unsafe_allow_html=True)
+        
+        st.markdown("""
+        <div style='border-bottom:1px solid #e5e7eb;padding-bottom:16px;margin-bottom:16px'>
+            <div style='display:flex;justify-content:space-between;align-items:center;margin-bottom:8px'>
+                <span style='font-size:13px;color:#6b7280'>Total Billed</span>
+                <span style='font-size:18px;font-weight:600'>$1,850K</span>
+            </div>
+            <div style='width:100%;height:8px;background:#e5e7eb;border-radius:4px'>
+                <div style='width:100%;height:8px;background:#3b82f6;border-radius:4px'></div>
+            </div>
+        </div>
+        
+        <div style='border-bottom:1px solid #e5e7eb;padding-bottom:16px;margin-bottom:16px'>
+            <div style='display:flex;justify-content:space-between;align-items:center;margin-bottom:8px'>
+                <span style='font-size:13px;color:#6b7280'>Collected</span>
+                <span style='font-size:18px;font-weight:600;color:#10b981'>$1,443K</span>
+            </div>
+            <div style='width:100%;height:8px;background:#e5e7eb;border-radius:4px'>
+                <div style='width:78%;height:8px;background:#10b981;border-radius:4px'></div>
+            </div>
+            <div style='font-size:11px;color:#9ca3af;margin-top:4px'>78% Collection Rate</div>
+        </div>
+        
+        <div style='border-bottom:1px solid #e5e7eb;padding-bottom:16px'>
+            <div style='display:flex;justify-content:space-between;align-items:center;margin-bottom:8px'>
+                <span style='font-size:13px;color:#6b7280'>Outstanding</span>
+                <span style='font-size:18px;font-weight:600;color:#f59e0b'>$407K</span>
+            </div>
+            <div style='width:100%;height:8px;background:#e5e7eb;border-radius:4px'>
+                <div style='width:22%;height:8px;background:#f59e0b;border-radius:4px'></div>
+            </div>
+            <div style='font-size:11px;color:#9ca3af;margin-top:4px'>22% Uncollected</div>
+        </div>
+        """, unsafe_allow_html=True)
         st.markdown("</div>", unsafe_allow_html=True)
+
+    st.markdown("---")
+
+    # Key Financial Highlights
+    st.markdown("<div class='panel'><h3>Key Financial Highlights</h3>", unsafe_allow_html=True)
+
+    col1, col2, col3 = st.columns(3)
+
+    with col1:
+        st.markdown("""
+        <div style='border-left:4px solid #3b82f6;padding-left:16px'>
+            <h4 style='font-size:16px;font-weight:600;margin-bottom:12px'>Staff Cost Allocation</h4>
+            <ul style='font-size:13px;color:#6b7280;line-height:1.8;list-style:none;padding:0'>
+                <li>• 21.4% of total budget allocated to staff</li>
+                <li>• $450K annual staff costs</li>
+                <li>• Within industry benchmark (20-25%)</li>
+            </ul>
+        </div>
+        """, unsafe_allow_html=True)
+
+    with col2:
+        st.markdown("""
+        <div style='border-left:4px solid #f59e0b;padding-left:16px'>
+            <h4 style='font-size:16px;font-weight:600;margin-bottom:12px'>Non-Revenue Water</h4>
+            <ul style='font-size:13px;color:#6b7280;line-height:1.8;list-style:none;padding:0'>
+                <li>• Current NRW at 32% (Target: 25%)</li>
+                <li>• 2.84M m³ water lost annually</li>
+                <li>• Estimated revenue loss: $890K</li>
+            </ul>
+        </div>
+        """, unsafe_allow_html=True)
+
+    with col3:
+        st.markdown("""
+        <div style='border-left:4px solid #ef4444;padding-left:16px'>
+            <h4 style='font-size:16px;font-weight:600;margin-bottom:12px'>Debt Management</h4>
+            <ul style='font-size:13px;color:#6b7280;line-height:1.8;list-style:none;padding:0'>
+                <li>• 78% collection efficiency</li>
+                <li>• $320K in outstanding bills</li>
+                <li>• 15.6% debt over 90 days old</li>
+            </ul>
+        </div>
+        """, unsafe_allow_html=True)
+
+    st.markdown("</div>", unsafe_allow_html=True)
 
 
 # ----------------------------- Additional Scenes -----------------------------
 
-def scene_sanitation():
+def scene_production():
     st.markdown("<div class='panel'><h3>Sanitation & Reuse Chain</h3>", unsafe_allow_html=True)
     sc = _load_json("sanitation_chain.json") or {
         "month": "2025-03", "collected_mld": 68, "treated_mld": 43, "ww_reused_mld": 12,
@@ -1151,12 +1854,14 @@ def render_uhn_dashboard():
         ("access", "Access & Coverage"),
         ("quality", "Service Quality & Reliability"),
         ("finance", "Financial Health"),
-        ("sanitation", "Sanitation & Reuse Chain"),
-        ("governance", "Governance & Compliance"),
-        ("sector", "Sector & Environment"),
+        ("production", "Production"),
     ]
 
+    valid_scene_keys = {key for key, _ in scene_labels}
     active = st.session_state.get("active_scene", "exec")
+    if active not in valid_scene_keys:
+        active = "exec"
+        st.session_state["active_scene"] = active
     cols = st.columns(len(scene_labels))
     for (key, label), col in zip(scene_labels, cols):
         with col:
@@ -1167,8 +1872,9 @@ def render_uhn_dashboard():
                 st.rerun()
 
     def go_to(scene_key: str):
-        st.session_state["active_scene"] = scene_key
-        st.rerun()
+        if scene_key in valid_scene_keys:
+            st.session_state["active_scene"] = scene_key
+            st.rerun()
 
     # Render active scene
     if active == "exec":
@@ -1179,12 +1885,8 @@ def render_uhn_dashboard():
         scene_quality()
     elif active == "finance":
         scene_finance()
-    elif active == "sanitation":
-        scene_sanitation()
-    elif active == "governance":
-        scene_governance()
-    elif active == "sector":
-        scene_sector()
+    elif active == "production":
+        scene_production()
     else:
         scene_executive(go_to)
 
@@ -1225,12 +1927,8 @@ def render_scene_page(scene_key: str):
         scene_quality()
     elif scene_key == "finance":
         scene_finance()
-    elif scene_key == "sanitation":
-        scene_sanitation()
-    elif scene_key == "governance":
-        scene_governance()
-    elif scene_key == "sector":
-        scene_sector()
+    elif scene_key == "production":
+        scene_production()
     else:
         scene_executive(lambda key: None)
     st.markdown("</div>", unsafe_allow_html=True)
