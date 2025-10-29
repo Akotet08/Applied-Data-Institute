@@ -17,6 +17,7 @@ try:
 except Exception:
     HAS_FOLIUM = False
 
+import numpy as np 
 
 # ----------------------------- Styles & Shell -----------------------------
 
@@ -330,112 +331,558 @@ def scene_executive(go_to):
         st.markdown("</div>", unsafe_allow_html=True)
 
 
+def load_csv_data() -> Dict[str, pd.DataFrame]:
+    """
+    Read sewer and water access CSV datasets from disk and cache the resulting DataFrames.
+    """
+    csv_map = {
+        "sewer": "Sewer Access Data.csv",
+        "water": "Water Access Data.csv",
+    }
+    frames: Dict[str, pd.DataFrame] = {}
+    for key, filename in csv_map.items():
+        path = DATA_DIR / filename
+        if not path.exists():
+            raise FileNotFoundError(f"File not found: {path}")
+        frames[key] = pd.read_csv(path)
+    return frames
+
+
+def _normalise_access_df(df: pd.DataFrame, *, prefix: str, extra_pct_cols: Optional[List[str]] = None) -> pd.DataFrame:
+    """
+    Clean up access data: trim text, coerce numeric percentage columns, and ensure year is numeric.
+    """
+    frame = df.copy()
+    if "zone" in frame.columns:
+        frame["zone"] = frame["zone"].astype(str).str.strip()
+    if "country" in frame.columns:
+        frame["country"] = frame["country"].astype(str).str.strip()
+    if "year" in frame.columns:
+        frame["year"] = pd.to_numeric(frame["year"], errors="coerce").astype("Int64")
+    pct_cols = [col for col in frame.columns if col.startswith(prefix) and col.endswith("_pct")]
+    if extra_pct_cols:
+        pct_cols.extend(col for col in extra_pct_cols if col in frame.columns)
+    for col in pct_cols:
+        frame[col] = pd.to_numeric(frame[col], errors="coerce")
+    return frame
+
+
+def _latest_snapshot(
+    df: pd.DataFrame,
+    *,
+    rename_map: Dict[str, str],
+    additional_columns: Optional[List[str]] = None,
+) -> pd.DataFrame:
+    """
+    Return the most recent record per (country, zone) pair and rename columns for clarity.
+    """
+    keys = [col for col in ("country", "zone") if col in df.columns]
+    if not keys:
+        keys = ["zone"]
+    if "year" in df.columns:
+        idx = df.groupby(keys)["year"].idxmax()
+        latest = df.loc[idx].copy()
+    else:
+        latest = df.drop_duplicates(keys, keep="last").copy()
+    keep_cols = set(keys + ["year"] + list(rename_map.keys()))
+    if additional_columns:
+        keep_cols.update(additional_columns)
+    available_cols = [col for col in keep_cols if col in latest.columns]
+    latest = latest[available_cols]
+    latest = latest.rename(columns=rename_map)
+    return latest
+
+
+def _zone_identifier(country: Optional[str], zone: Optional[str]) -> str:
+    base = f"{country or 'na'}-{zone or 'zone'}".lower()
+    return re.sub(r"[^a-z0-9]+", "-", base).strip("-") or "zone"
+
+
+@st.cache_data
+def _prepare_service_data() -> Dict[str, Any]:
+    """
+    Prepare service quality data for visualization.
+    Returns a dictionary containing processed service data including:
+    - Full service data DataFrame
+    - Latest snapshots by zone
+    - Aggregated time series for key metrics
+    """
+    # Load service data
+    service_path = DATA_DIR / "Service_data.csv"
+    if not service_path.exists():
+        raise FileNotFoundError(f"Service data file not found: {service_path}")
+    
+    df = pd.read_csv(service_path)
+    
+    # Clean and process data
+    # Convert month and year to datetime
+    df['date'] = pd.to_datetime(df['year'].astype(str) + '-' + df['month'].astype(str).str.zfill(2) + '-01')
+    df = df.sort_values('date')
+    
+    # Calculate derived metrics
+    df['water_quality_rate'] = ((df['test_passed_chlorine'] / df['tests_conducted_chlorine'] * 100 +
+                                df['tests_passed_ecoli'] / df['test_conducted_ecoli'] * 100) / 2)
+    df['complaint_resolution_rate'] = (df['resolved'] / df['complaints'] * 100)
+    df['nrw_rate'] = ((df['w_supplied'] - df['total_consumption']) / df['w_supplied'] * 100)
+    df['sewer_coverage_rate'] = (df['sewer_connections'] / df['households'] * 100)
+    
+    # Get latest snapshot
+    latest_by_zone = df.sort_values('date').groupby(['country', 'city', 'zone']).last().reset_index()
+    
+    # Aggregate time series
+    time_series = df.groupby('date').agg({
+        'w_supplied': 'sum',
+        'total_consumption': 'sum',
+        'metered': 'sum',
+        'water_quality_rate': 'mean',
+        'complaint_resolution_rate': 'mean',
+        'nrw_rate': 'mean',
+        'sewer_coverage_rate': 'mean',
+        'public_toilets': 'sum'
+    }).reset_index()
+    
+    return {
+        "full_data": df,
+        "latest_by_zone": latest_by_zone,
+        "time_series": time_series,
+        "zones": sorted(df['zone'].unique()),
+        "cities": sorted(df['city'].unique()),
+        "countries": sorted(df['country'].unique())
+    }
+
+def _prepare_access_data() -> Dict[str, Any]:
+    """
+    Prepare derived access datasets for the Access & Coverage scene.
+    Returns cached water/sewer snapshots, full histories, and zone-level summaries.
+    """
+    csv_data = load_csv_data()
+    water_df = _normalise_access_df(csv_data["water"], prefix="w_", extra_pct_cols=["municipal_coverage"])
+    sewer_df = _normalise_access_df(csv_data["sewer"], prefix="s_")
+
+    water_latest = _latest_snapshot(
+        water_df,
+        rename_map={
+            "year": "water_year",
+            "w_safely_managed_pct": "water_safely_pct",
+            "w_basic_pct": "water_basic_pct",
+            "w_limited_pct": "water_limited_pct",
+            "w_unimproved_pct": "water_unimproved_pct",
+            "surface_water_pct": "water_surface_pct",
+            "municipal_coverage": "water_municipal_coverage",
+        },
+        additional_columns=["municipal_coverage", "w_safely_managed", "w_basic", "w_limited", "w_unimproved", "surface_water"],
+    )
+    sewer_latest = _latest_snapshot(
+        sewer_df,
+        rename_map={
+            "year": "sewer_year",
+            "s_safely_managed_pct": "sewer_safely_pct",
+            "s_basic_pct": "sewer_basic_pct",
+            "s_limited_pct": "sewer_limited_pct",
+            "s_unimproved_pct": "sewer_unimproved_pct",
+            "open_def_pct": "sewer_open_def_pct",
+        },
+        additional_columns=["s_safely_managed", "s_basic", "s_limited", "s_unimproved", "open_def"],
+    )
+
+    merge_keys = [col for col in ("country", "zone") if col in water_latest.columns and col in sewer_latest.columns]
+    if not merge_keys:
+        merge_keys = ["zone"]
+    zones_df = water_latest.merge(sewer_latest, on=merge_keys, how="outer", suffixes=("", "_dup"))
+    if "country_dup" in zones_df.columns and "country" not in merge_keys:
+        zones_df["country"] = zones_df["country"].fillna(zones_df["country_dup"])
+        zones_df = zones_df.drop(columns=["country_dup"])
+    zones_df["safeAccess"] = zones_df[["water_safely_pct", "sewer_safely_pct"]].mean(axis=1, skipna=True)
+    zone_records: List[Dict[str, Any]] = []
+    for _, row in zones_df.sort_values(by=[col for col in ("country", "zone") if col in zones_df.columns]).iterrows():
+        record = {
+            "id": _zone_identifier(row.get("country"), row.get("zone")),
+            "name": row.get("zone"),
+            "country": row.get("country"),
+            "safeAccess": float(row["safeAccess"]) if pd.notna(row.get("safeAccess")) else None,
+            "water_safely_pct": float(row["water_safely_pct"]) if pd.notna(row.get("water_safely_pct")) else None,
+            "sewer_safely_pct": float(row["sewer_safely_pct"]) if pd.notna(row.get("sewer_safely_pct")) else None,
+            "water_year": int(row["water_year"]) if pd.notna(row.get("water_year")) else None,
+            "sewer_year": int(row["sewer_year"]) if pd.notna(row.get("sewer_year")) else None,
+        }
+        zone_records.append(record)
+
+    return {
+        "water_full": water_df,
+        "sewer_full": sewer_df,
+        "water_latest": water_latest,
+        "sewer_latest": sewer_latest,
+        "zones": zone_records,
+    }
+
+
+ACCESS_WATER_FILE = DATA_DIR / "Water Access Data.csv"
+ACCESS_SEWER_FILE = DATA_DIR / "Sewer Access Data.csv"
+
+
+@st.cache_data
+def _load_access_kpi_data() -> pd.DataFrame:
+    """
+    Combine the water and sewer access CSVs into a tidy structure.
+    """
+    frames: List[pd.DataFrame] = []
+    for path in (ACCESS_WATER_FILE, ACCESS_SEWER_FILE):
+        if not path.exists():
+            continue
+        try:
+            frame = pd.read_csv(path)
+        except Exception:
+            continue
+        frame.columns = frame.columns.str.replace(r"^(w_|s_)", "", regex=True)
+        frames.append(frame)
+    if not frames:
+        return pd.DataFrame()
+    df = pd.concat(frames, ignore_index=True)
+    df.columns = df.columns.str.replace(r"^(w_|s_)", "", regex=True)
+    if "year" in df.columns:
+        df["year"] = pd.to_numeric(df["year"], errors="coerce").astype("Int64")
+    for col in ("zone", "country", "type"):
+        if col in df.columns:
+            df[col] = df[col].astype("string").str.strip()
+    if "type" in df.columns:
+        df["type"] = (
+            df["type"]
+            .astype("string")
+            .str.strip()
+            .str.lower()
+            .replace({"w_access": "water", "s_access": "sewer"})
+        )
+    numeric_cols = {col for col in df.columns if col.endswith("_pct")}
+    numeric_cols.update({"popn_total", "surface_water", "safely_managed", "open_def", "unimproved"})
+    for col in numeric_cols:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+    return df
+
+
+def _ensure_year_int(df: pd.DataFrame) -> pd.DataFrame:
+    if "year" in df.columns:
+        df["year"] = pd.to_numeric(df["year"], errors="coerce").astype("Int64")
+    return df
+
+
+def _country_summary_2024(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Aggregate 2024 safely managed metrics per (country, type).
+    """
+    d = df.copy()
+    d = d[d["year"] == 2024]
+    if d.empty:
+        return d
+    if "type" not in d.columns:
+        d["type"] = "unknown"
+    d["sewer_gap_pct"] = d.get("unimproved_pct", np.nan) + d.get("open_def_pct", np.nan)
+    agg = (
+        d.groupby(["country", "type"])
+        .agg(
+            safely_min=("safely_managed_pct", "min"),
+            safely_med=("safely_managed_pct", "median"),
+            safely_max=("safely_managed_pct", "max"),
+            open_def_min=("open_def_pct", "min"),
+            open_def_med=("open_def_pct", "median"),
+            open_def_max=("open_def_pct", "max"),
+            unimproved_min=("unimproved_pct", "min"),
+            unimproved_med=("unimproved_pct", "median"),
+            unimproved_max=("unimproved_pct", "max"),
+            sewer_gap_min=("sewer_gap_pct", "min"),
+            sewer_gap_med=("sewer_gap_pct", "median"),
+            sewer_gap_max=("sewer_gap_pct", "max"),
+            zones=("zone", "nunique"),
+            popn_sum=("popn_total", "sum"),
+        )
+        .reset_index()
+    )
+    return agg
+
+
+def _surface_water_2024(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    For 2024 water records, return per-zone exposure and per-country ranges.
+    """
+    d = df.copy()
+    d = d[(d["year"] == 2024) & (d.get("type") == "water")]
+    if d.empty:
+        return d, pd.DataFrame()
+    if "surface_water_pct" not in d.columns:
+        d["surface_water_pct"] = np.nan
+    if "popn_total" not in d.columns:
+        d["popn_total"] = np.nan
+    d = d.dropna(subset=["surface_water_pct", "popn_total"]).copy()
+    if d.empty:
+        return d, pd.DataFrame()
+    d["surface_users_est"] = (d["surface_water_pct"] / 100.0) * d["popn_total"]
+    rng = (
+        d.groupby("country")
+        .agg(
+            pct_min=("surface_water_pct", "min"),
+            pct_med=("surface_water_pct", "median"),
+            pct_max=("surface_water_pct", "max"),
+            users_min=("surface_users_est", "min"),
+            users_med=("surface_users_est", "median"),
+            users_max=("surface_users_est", "max"),
+        )
+        .reset_index()
+    )
+    return d, rng
+
+
+def _trend_series(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Return rows between 2020 and 2024 for time-series visualisations.
+    """
+    if "year" not in df.columns:
+        return pd.DataFrame()
+    return df[(df["year"] >= 2020) & (df["year"] <= 2024)].copy()
+
+
+def _urban_rural_tag(zone: Any) -> str:
+    if pd.isna(zone):
+        return "unknown"
+    z = str(zone).lower()
+    if "rural" in z:
+        return "rural"
+    if "urban" in z:
+        return "urban"
+    if any(k in z for k in ["yaounde", "douala", "kawempe", "kampala", "maseru", "lilongwe", "blantyre"]):
+        return "urban"
+    return "other"
+
+
 def scene_access():
-    # Left column: zones and gap panel
-    l, r = st.columns([1, 2])
+    df = _load_access_kpi_data()
+    if df.empty:
+        st.info("Access datasets not available. Ensure the Water and Sewer access CSVs are in the Data directory.")
+        return
 
-    with l:
-        st.markdown("<div class='panel'><h3>Zones Map</h3>", unsafe_allow_html=True)
-        # Try interactive map overlay; falls back to grid if geojson or folium not available
-        if HAS_FOLIUM:
-            selected_name = _render_zone_map_overlay(
-                geojson_path="Data/zones.geojson",
-                id_property="id",
-                name_property="name",
-                metric_property="safeAccess",
-                key="zones_map_access",
+    df = _ensure_year_int(df)
+    summary_2024 = _country_summary_2024(df)
+
+    st.markdown("<div class='panel'><h3>2024 Safely Managed Coverage by Country</h3>", unsafe_allow_html=True)
+    safely_med = summary_2024.dropna(subset=["safely_med"]).copy() if not summary_2024.empty else pd.DataFrame()
+    if safely_med.empty:
+        st.info("No safely managed coverage records found for 2024.")
+    else:
+        fig_overall = px.bar(
+            safely_med,
+            x="country",
+            y="safely_med",
+            color="type",
+            barmode="group",
+            hover_data={
+                "safely_med": ":.1f",
+                "safely_min": ":.1f",
+                "safely_max": ":.1f",
+                "open_def_med": ":.1f",
+                "unimproved_med": ":.1f",
+                "zones": True,
+                "popn_sum": True,
+            },
+        )
+        fig_overall.update_layout(
+            margin=dict(l=10, r=10, t=10, b=10),
+            yaxis_title="Safely managed % (median)",
+            legend_title="Service",
+        )
+        st.plotly_chart(fig_overall, width="stretch", config={"displayModeBar": False})
+        st.caption("Hover for min/max ranges, open defecation, unimproved shares, zone counts, and population totals.")
+    st.markdown("</div>", unsafe_allow_html=True)
+
+    st.markdown("<div class='panel'><h3>2024 Sewer Access Gap (Unimproved + Open Defecation)</h3>", unsafe_allow_html=True)
+    sewer_gap = summary_2024[summary_2024["type"] == "sewer"].dropna(subset=["sewer_gap_med"]).copy() if not summary_2024.empty else pd.DataFrame()
+    if sewer_gap.empty:
+        st.info("No sewer access gap data available for 2024.")
+    else:
+        fig_gap = px.bar(
+            sewer_gap,
+            x="country",
+            y="sewer_gap_med",
+            hover_data={"sewer_gap_min": ":.1f", "sewer_gap_max": ":.1f"},
+        )
+        fig_gap.update_layout(
+            margin=dict(l=10, r=10, t=10, b=10),
+            yaxis_title="Gap % (median)",
+            showlegend=False,
+        )
+        st.plotly_chart(fig_gap, width="stretch", config={"displayModeBar": False})
+    st.markdown("</div>", unsafe_allow_html=True)
+
+    st.markdown("<div class='panel'><h3>Surface Water Exposure (Water type, 2024)</h3>", unsafe_allow_html=True)
+    sw_2024, sw_ranges = _surface_water_2024(df)
+    if sw_2024.empty:
+        st.info("No surface water metrics recorded for 2024.")
+    else:
+        left, right = st.columns(2)
+        fig_surface_pct = px.strip(
+            sw_2024,
+            x="country",
+            y="surface_water_pct",
+            hover_data=["zone", "surface_water_pct", "popn_total", "surface_users_est"],
+        )
+        fig_surface_pct.update_layout(
+            margin=dict(l=10, r=10, t=10, b=10),
+            yaxis_title="Surface water users (%)",
+            xaxis_title=None,
+        )
+        fig_surface_cnt = px.scatter(
+            sw_2024,
+            x="country",
+            y="surface_users_est",
+            size="popn_total",
+            size_max=45,
+            hover_data=["zone", "surface_water_pct", "popn_total", "surface_users_est"],
+        )
+        fig_surface_cnt.update_layout(
+            margin=dict(l=10, r=10, t=10, b=10),
+            yaxis_title="Estimated users",
+            xaxis_title=None,
+        )
+        with left:
+            st.plotly_chart(fig_surface_pct, width="stretch", config={"displayModeBar": False})
+        with right:
+            st.plotly_chart(fig_surface_cnt, width="stretch", config={"displayModeBar": False})
+        if not sw_ranges.empty:
+            st.caption("Per-country surface water exposure ranges (2024).")
+            st.dataframe(sw_ranges.round(1), width="stretch")
+    st.markdown("</div>", unsafe_allow_html=True)
+
+    st.markdown("<div class='panel'><h3>Population Coverage Trend (2020–2024)</h3>", unsafe_allow_html=True)
+    ts = _trend_series(df)
+    if ts.empty or "popn_total" not in ts.columns or ts["popn_total"].dropna().empty:
+        st.info("Population totals unavailable for the requested period.")
+    else:
+        pop_trend = ts.groupby(["country", "year"], as_index=False)["popn_total"].sum()
+        fig_pop_trend = px.line(
+            pop_trend,
+            x="year",
+            y="popn_total",
+            color="country",
+            markers=True,
+        )
+        fig_pop_trend.update_layout(
+            margin=dict(l=10, r=10, t=10, b=10),
+            yaxis_title="Population",
+            legend_title="Country",
+        )
+        st.plotly_chart(fig_pop_trend, width="stretch", config={"displayModeBar": False})
+    st.markdown("</div>", unsafe_allow_html=True)
+
+    st.markdown("<div class='panel'><h3>Urban vs Rural Disparities (2024)</h3>", unsafe_allow_html=True)
+    ur = df[df["year"] == 2024].copy()
+    if ur.empty or "country" not in ur.columns:
+        st.info("No 2024 records available to compare urban and rural zones.")
+    else:
+        ur["ur_tag"] = ur["zone"].map(_urban_rural_tag)
+        ur["country"] = ur["country"].astype("string")
+        les = ur[ur["country"].str.upper() == "LESOTHO"].copy()
+        mw = ur[ur["country"].str.upper() == "MALAWI"].copy()
+        col1, col2 = st.columns(2)
+        if not les.empty:
+            fig_les = px.bar(
+                les,
+                x="zone",
+                y="safely_managed_pct",
+                color="type",
+                hover_data=["ur_tag", "open_def_pct", "unimproved_pct"],
             )
-            if selected_name:
-                st.session_state["selected_zone"] = next((z for z in ZONES if z["name"] == selected_name), None)
-
-        # Zone grid (fallback + visual)
-        st.markdown("<div class='zonegrid'>", unsafe_allow_html=True)
-        cols = st.columns(2)
-        for i, z in enumerate(ZONES):
-            with cols[i % 2]:
-                color = "#10b981" if z["safeAccess"] >= 80 else ("#f59e0b" if z["safeAccess"] >= 60 else "#ef4444")
-                st.markdown(
-                    f"<div class='zonecard'><div style='display:flex;justify-content:space-between;align-items:center'><span style='font:600 12px Inter'>{z['name']}</span><span class='dot' style='background:{color}'></span></div><div style='height:8px;background:#f1f5f9;border-radius:6px;margin-top:8px'><div style='height:8px;width:{z['safeAccess']}%;background:{color};border-radius:6px'></div></div><div class='meta'>Safe access: {z['safeAccess']}%</div></div>",
-                    unsafe_allow_html=True,
-                )
-                st.button("Select", key=f"select_zone_{z['id']}", on_click=lambda zz=z: st.session_state.update({"selected_zone": zz}), use_container_width=True)
-        st.markdown("</div>", unsafe_allow_html=True)
-        st.markdown("</div>", unsafe_allow_html=True)
-
-        # Gap panel
-        st.markdown("<div class='panel'><h3>Gap to Target</h3>", unsafe_allow_html=True)
-        current = (st.session_state.get("selected_zone") or {"safeAccess": round(sum(z["safeAccess"] for z in ZONES)/len(ZONES))})["safeAccess"]
-        target = 80
-        st.metric("Current", f"{current}%")
-        st.metric("Target", f"{target}%")
-        st.metric("Gap", f"{max(0, target-current)}%")
-        proj = st.slider("Projection (+% over next 12 months)", 0, 10, 0)
-        st.caption(f"Projected safely managed: {min(100, current + proj)}%")
-        st.markdown("</div>", unsafe_allow_html=True)
-
-    with r:
-        st.markdown("<div class='panel'>", unsafe_allow_html=True)
-        st.markdown("<div style='display:flex;align-items:center;justify-content:space-between'><h3>Service Ladders</h3>", unsafe_allow_html=True)
-        ac = _load_json("access_coverage.json")
-        if ac and "zones" in ac:
-            df_water = pd.DataFrame([{**{"zone": z["zone"]}, **z.get("water_ladder", {})} for z in ac["zones"]])
-            df_san = pd.DataFrame([{**{"zone": z["zone"]}, **z.get("san_ladder", {})} for z in ac["zones"]])
+            fig_les.update_layout(
+                margin=dict(l=10, r=10, t=10, b=10),
+                xaxis_tickangle=-30,
+                yaxis_title="Safely managed %",
+                legend_title="Service",
+            )
+            with col1:
+                st.plotly_chart(fig_les, width="stretch", config={"displayModeBar": False})
         else:
-            df = pd.DataFrame(SERVICE_LADDER)
-            df_water = df.rename(columns={"safely_managed": "safely"})[["zone", "basic", "limited", "unimproved", "safely"]]
-            df_water.insert(0, "surface", [5,4,3,8,2][: len(df_water)])
-            df_san = df.rename(columns={"safely_managed": "safely", "open_defecation": "open_def"})[["zone", "open_def", "unimproved", "limited", "basic", "safely"]]
-        if st.session_state.get("selected_zone"):
-            name = st.session_state["selected_zone"]["name"].lower()
-            df_water = df_water[df_water["zone"].str.lower().str.contains(name)]
-            df_san = df_san[df_san["zone"].str.lower().str.contains(name)]
-        _download_button("service-ladder-water.csv", df_water.to_dict(orient="records"))
-        _download_button("service-ladder-sanitation.csv", df_san.to_dict(orient="records"))
-        st.markdown("</div>", unsafe_allow_html=True)
-        # Water ladder stacked bar
-        fig_w = go.Figure()
-        water_order = ["surface", "unimproved", "limited", "basic", "safely"]
-        water_colors = {"surface": "#9ca3af", "unimproved": "#a3a3a3", "limited": "#f59e0b", "basic": "#60a5fa", "safely": "#10b981"}
-        xw = df_water["zone"].tolist()
-        base = [0] * len(xw)
-        for key in water_order:
-            if key in df_water.columns:
-                fig_w.add_bar(x=xw, y=df_water[key], name=key.replace("_", " ").title(), marker_color=water_colors[key], base=base)
-                base = [b + v for b, v in zip(base, df_water[key].tolist())]
-        fig_w.update_layout(barmode="stack", margin=dict(l=10, r=10, t=10, b=10))
-        st.plotly_chart(fig_w, use_container_width=True, config={"displayModeBar": False}, key="access_water_ladder")
-        st.caption("Water ladder • household_survey + lab_results")
+            col1.info("No Lesotho records found for 2024.")
+        if not mw.empty:
+            fig_mw = px.bar(
+                mw,
+                x="zone",
+                y="safely_managed_pct",
+                color="type",
+                hover_data=["ur_tag", "open_def_pct", "unimproved_pct"],
+            )
+            fig_mw.update_layout(
+                margin=dict(l=10, r=10, t=10, b=10),
+                xaxis_tickangle=-30,
+                yaxis_title="Safely managed %",
+                legend_title="Service",
+            )
+            with col2:
+                st.plotly_chart(fig_mw, width="stretch", config={"displayModeBar": False})
+        else:
+            col2.info("No Malawi records found for 2024.")
+    st.markdown("</div>", unsafe_allow_html=True)
 
-        # Sanitation ladder stacked bar
-        fig_s = go.Figure()
-        san_order = ["open_def", "unimproved", "limited", "basic", "safely"]
-        san_colors = {"open_def": "#ef4444", "unimproved": "#a3a3a3", "limited": "#f59e0b", "basic": "#60a5fa", "safely": "#10b981"}
-        xs = df_san["zone"].tolist()
-        base = [0] * len(xs)
-        for key in san_order:
-            if key in df_san.columns:
-                fig_s.add_bar(x=xs, y=df_san[key], name=key.replace("_", " ").title(), marker_color=san_colors[key], base=base)
-                base = [b + v for b, v in zip(base, df_san[key].tolist())]
-        fig_s.update_layout(barmode="stack", margin=dict(l=10, r=10, t=10, b=10))
-        st.plotly_chart(fig_s, use_container_width=True, config={"displayModeBar": False}, key="access_san_ladder")
-        st.caption("Sanitation ladder • household_survey")
-        st.markdown("</div>", unsafe_allow_html=True)
+    st.markdown("<div class='panel'><h3>Focused Zone Trends (2020–2024)</h3>", unsafe_allow_html=True)
+    if ts.empty or "zone" not in ts.columns or "country" not in ts.columns:
+        st.info("Time series data unavailable for the 2020–2024 window.")
+    else:
+        focus_mask = ts["zone"].str.contains("yaounde|maseru|kawempe", case=False, na=False) | ts["country"].astype("string").str.upper().isin(["MALAWI"])
+        focus_zones = ts[focus_mask].copy()
+        if focus_zones.empty:
+            st.info("No focus zones matched the current filters.")
+        else:
+            fig_yoy = px.line(
+                focus_zones,
+                x="year",
+                y="safely_managed_pct",
+                color="zone",
+                facet_row="country",
+                facet_col="type",
+                markers=True,
+                hover_data=["country", "zone", "type"],
+            )
+            fig_yoy.update_layout(
+                margin=dict(l=10, r=10, t=40, b=10),
+                yaxis_title="Safely managed %",
+            )
+            st.plotly_chart(fig_yoy, width="stretch", config={"displayModeBar": False})
+    st.markdown("</div>", unsafe_allow_html=True)
 
-        # Coverage dynamics + sparkline
-        st.markdown("<div class='panel'>", unsafe_allow_html=True)
-        st.markdown("<div style='display:flex;align-items:center;justify-content:space-between'><h3>Coverage Dynamics</h3>", unsafe_allow_html=True)
-        dynamics = (ac or {}).get("dynamics") if ac else None
-        coverage = (ac or {}).get("coverage") if ac else None
-        cols_dyn = st.columns(3)
-        cols_dyn[0].metric("Water coverage %", (coverage or {}).get("pct_water", 68))
-        cols_dyn[1].metric("Sewered %", (coverage or {}).get("pct_sewered", 22))
-        cols_dyn[2].metric("Growth water %", (dynamics or {}).get("pct_water_growth", 3.1))
-        df_prog = pd.DataFrame(PROGRESS)
-        fig2 = px.line(df_prog, x="m", y="v", markers=False)
-        fig2.update_layout(margin=dict(l=10, r=10, t=10, b=10))
-        st.plotly_chart(fig2, use_container_width=True, config={"displayModeBar": False}, key="access_coverage_spark")
-        st.markdown("</div>", unsafe_allow_html=True)
-
+    st.markdown("<div class='panel'><h3>Priority Zones (2024 snapshot)</h3>", unsafe_allow_html=True)
+    if ur.empty or "country" not in ur.columns or "zone" not in ur.columns:
+        st.info("Priority ranking unavailable without 2024 records.")
+    else:
+        priority = (
+            ur.assign(sewer_gap_pct=lambda x: x.get("unimproved_pct", np.nan) + x.get("open_def_pct", np.nan))
+            .loc[
+                lambda x: (
+                    (x["country"].str.upper() == "MALAWI")
+                    | (x["zone"].str.contains("kawempe", case=False, na=False))
+                    | (x["zone"].str.contains("yaounde 1", case=False, na=False))
+                    | ((x["country"].str.upper() == "LESOTHO") & (x["zone"].str.contains("rural", case=False, na=False)))
+                )
+            ][
+                ["country", "zone", "type", "popn_total", "safely_managed_pct", "open_def_pct", "unimproved_pct", "sewer_gap_pct"]
+            ]
+            .sort_values(["country", "zone", "type"])
+        )
+        if priority.empty:
+            st.info("Priority filter returned no rows.")
+        else:
+            priority_display = priority.rename(
+                columns={
+                    "popn_total": "population",
+                    "safely_managed_pct": "safely_managed_%",
+                    "open_def_pct": "open_def_%",
+                    "unimproved_pct": "unimproved_%",
+                    "sewer_gap_pct": "sewer_gap_%",
+                }
+            ).copy()
+            percent_cols = [col for col in priority_display.columns if col.endswith("%")]
+            for col in percent_cols:
+                priority_display[col] = priority_display[col].round(1)
+            if "population" in priority_display.columns:
+                priority_display["population"] = pd.to_numeric(priority_display["population"], errors="coerce").round(0).astype("Int64")
+            st.dataframe(priority_display, width="stretch")
+            st.caption("Sewer gap = unimproved % + open defecation % (sewer).")
+    st.markdown("</div>", unsafe_allow_html=True)
 
 def scene_quality():
     # Zone filter
