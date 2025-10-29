@@ -397,6 +397,57 @@ def _zone_identifier(country: Optional[str], zone: Optional[str]) -> str:
 
 
 @st.cache_data
+def _prepare_service_data() -> Dict[str, Any]:
+    """
+    Prepare service quality data for visualization.
+    Returns a dictionary containing processed service data including:
+    - Full service data DataFrame
+    - Latest snapshots by zone
+    - Aggregated time series for key metrics
+    """
+    # Load service data
+    service_path = DATA_DIR / "Service_data.csv"
+    if not service_path.exists():
+        raise FileNotFoundError(f"Service data file not found: {service_path}")
+    
+    df = pd.read_csv(service_path)
+    
+    # Clean and process data
+    # Convert month and year to datetime
+    df['date'] = pd.to_datetime(df['year'].astype(str) + '-' + df['month'].astype(str).str.zfill(2) + '-01')
+    df = df.sort_values('date')
+    
+    # Calculate derived metrics
+    df['water_quality_rate'] = ((df['test_passed_chlorine'] / df['tests_conducted_chlorine'] * 100 +
+                                df['tests_passed_ecoli'] / df['test_conducted_ecoli'] * 100) / 2)
+    df['complaint_resolution_rate'] = (df['resolved'] / df['complaints'] * 100)
+    df['nrw_rate'] = ((df['w_supplied'] - df['total_consumption']) / df['w_supplied'] * 100)
+    df['sewer_coverage_rate'] = (df['sewer_connections'] / df['households'] * 100)
+    
+    # Get latest snapshot
+    latest_by_zone = df.sort_values('date').groupby(['country', 'city', 'zone']).last().reset_index()
+    
+    # Aggregate time series
+    time_series = df.groupby('date').agg({
+        'w_supplied': 'sum',
+        'total_consumption': 'sum',
+        'metered': 'sum',
+        'water_quality_rate': 'mean',
+        'complaint_resolution_rate': 'mean',
+        'nrw_rate': 'mean',
+        'sewer_coverage_rate': 'mean',
+        'public_toilets': 'sum'
+    }).reset_index()
+    
+    return {
+        "full_data": df,
+        "latest_by_zone": latest_by_zone,
+        "time_series": time_series,
+        "zones": sorted(df['zone'].unique()),
+        "cities": sorted(df['city'].unique()),
+        "countries": sorted(df['country'].unique())
+    }
+
 def _prepare_access_data() -> Dict[str, Any]:
     """
     Prepare derived access datasets for the Access & Coverage scene.
@@ -721,58 +772,278 @@ def scene_access():
         st.markdown("</div>", unsafe_allow_html=True)
 
 def scene_quality():
-    # Zone filter
-    # rely on sidebar zone
-
-    l, r = st.columns(2)
-    with l:
-        st.markdown("<div class='panel'><h3>Water Quality Compliance</h3>", unsafe_allow_html=True)
-        sq = _load_json("service_quality.json") or None
-        if sq:
-            df = pd.DataFrame({"m": sq["months"], "v": sq["dwq_pct"]})
+    # Load and process service data
+    service_data = _prepare_service_data()
+    df = service_data["full_data"]
+    
+    # Add filters in a clean layout with better styling
+    st.markdown("""
+        <div class='panel' style='margin-bottom: 20px'>
+            <h3 style='font-family: Inter, ui-sans-serif; margin-bottom: 15px; color: #0f172a'>
+                Service Area Filter
+            </h3>
+        </div>
+    """, unsafe_allow_html=True)
+    
+    filter_cols = st.columns([1, 1, 1])
+    
+    with filter_cols[0]:
+        countries = ['All'] + service_data["countries"]
+        selected_country = st.selectbox(
+            'Country',
+            countries,
+            key='quality_country',
+            help="Filter data by country"
+        )
+        
+    with filter_cols[1]:
+        if selected_country != 'All':
+            cities = ['All'] + sorted(df[df['country'] == selected_country]['city'].unique().tolist())
         else:
-            df = pd.DataFrame(WQ_MONTHLY)
-        df = _filter_df_by_months(df, "m")
-        target = 95
-        fig = px.line(df, x="m", y="v")
-        fig.add_hline(y=target, line_dash="dot", line_color="#ef4444")
-        fig.update_traces(mode="lines+markers")
-        st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False}, key="quality_wq_line")
-        below = df[df["v"] < target]["m"].tolist()
-        if below:
-            sel = st.selectbox("Below-target month", below, index=0)
-            st.info(f"Details for {sel}: DWQ {df.set_index('m').loc[sel, 'v']}% < target {target}% • Root cause placeholder • Actions placeholder")
-        st.markdown("</div>", unsafe_allow_html=True)
-    with r:
-        st.markdown("<div class='panel'><h3>Sewer Blockages</h3>", unsafe_allow_html=True)
-        unit_choice = st.session_state.get("blockage_basis", "per 100 km")
-        if sq and "blockages_per_100km" in sq and unit_choice == "per 100 km":
-            dfb = pd.DataFrame({"m": sq["months"], "v": sq["blockages_per_100km"]})
-        elif sq and unit_choice == "per 1000 connections" and "blockages_per_1000conn" in sq:
-            dfb = pd.DataFrame({"m": sq["months"], "v": sq["blockages_per_1000conn"]})
+            cities = ['All'] + service_data["cities"]
+        selected_city = st.selectbox(
+            'City',
+            cities,
+            key='quality_city',
+            help="Filter data by city"
+        )
+        
+    with filter_cols[2]:
+        if selected_city != 'All':
+            zones = ['All'] + sorted(df[df['city'] == selected_city]['zone'].unique().tolist())
         else:
-            dfb = pd.DataFrame(BLOCKAGES)
-            if unit_choice == "per 1000 connections":
-                st.caption("Data not available for per 1000 connections; showing per 100 km")
-        dfb = _filter_df_by_months(dfb, "m")
-        figb = px.bar(dfb, x="m", y="v", color_discrete_sequence=["#f59e0b"])
-        st.plotly_chart(figb, use_container_width=True, config={"displayModeBar": False}, key="quality_blockages")
-        st.markdown("</div>", unsafe_allow_html=True)
+            zones = ['All'] + service_data["zones"]
+        selected_zone = st.selectbox(
+            'Zone',
+            zones,
+            key='quality_zone',
+            help="Filter data by zone"
+        )
+    
+    # Apply filters to raw data
+    filtered_df = df.copy()
+    if selected_country != 'All':
+        filtered_df = filtered_df[filtered_df['country'] == selected_country]
+    if selected_city != 'All':
+        filtered_df = filtered_df[filtered_df['city'] == selected_city]
+    if selected_zone != 'All':
+        filtered_df = filtered_df[filtered_df['zone'] == selected_zone]
+    
+    # Add filter status indicator
+    filter_status = []
+    if selected_country != 'All':
+        filter_status.append(f"Country: {selected_country}")
+    if selected_city != 'All':
+        filter_status.append(f"City: {selected_city}")
+    if selected_zone != 'All':
+        filter_status.append(f"Zone: {selected_zone}")
+    if filter_status:
+        st.markdown(
+            f"""
+            <div style='background:#f0f9ff;border:1px solid #93c5fd;padding:8px 12px;border-radius:8px;margin:12px 0'>
+                <span style='font-weight:500'>Active Filters:</span> {' • '.join(filter_status)}
+            </div>
+            """,
+            unsafe_allow_html=True
+        )
+    
+    # Recalculate time series with filtered data
+    time_series = filtered_df.groupby('date').agg({
+        'w_supplied': 'sum',
+        'total_consumption': 'sum',
+        'metered': 'sum',
+        'water_quality_rate': 'mean',
+        'complaint_resolution_rate': 'mean',
+        'nrw_rate': 'mean',
+        'sewer_coverage_rate': 'mean',
+        'public_toilets': 'sum'
+    }).reset_index()
+    
+    # Calculate latest metrics for KPIs from filtered data
+    latest_data = filtered_df.sort_values('date').groupby(['country', 'city', 'zone']).last().reset_index()
+    
+    # Top KPI Section with improved styling
+    st.markdown("""
+        <div class='panel' style='margin-bottom: 20px'>
+            <h3 style='font-family: Inter, ui-sans-serif; margin-bottom: 15px; color: #0f172a'>
+                Key Performance Indicators
+            </h3>
+    """, unsafe_allow_html=True)
+    
+    # Calculate KPIs from filtered data
+    nrw = latest_data['nrw_rate'].mean()
+    water_quality = latest_data['water_quality_rate'].mean()
+    resolution_rate = latest_data['complaint_resolution_rate'].mean()
+    ww_treatment = latest_data['sewer_coverage_rate'].mean()  # Using sewer coverage as a proxy for treatment
+    
+    # KPI data with consistent styling
+    kpi_data = [
+        {
+            "label": "Non-Revenue Water",
+            "value": nrw,
+            "target": 25,
+            "color": "#ef4444" if nrw > 25 else "#10b981",
+            "icon": "💧"
+        },
+        {
+            "label": "Water Quality",
+            "value": water_quality,
+            "target": 95,
+            "color": "#10b981" if water_quality >= 95 else "#f59e0b",
+            "icon": "🧪"
+        },
+        {
+            "label": "Wastewater Treatment",
+            "value": ww_treatment,
+            "target": 80,
+            "color": "#10b981" if ww_treatment >= 80 else "#f59e0b",
+            "icon": "♻️"
+        },
+        {
+            "label": "Complaint Resolution",
+            "value": resolution_rate,
+            "target": 90,
+            "color": "#10b981" if resolution_rate >= 90 else "#f59e0b",
+            "icon": "✅"
+        }
+    ]
+    
+    # Display KPIs in a grid
+    cols = st.columns(4)
+    for i, kpi in enumerate(kpi_data):
+        with cols[i]:
+            gauge_style = _conic_css(kpi["value"], kpi["color"])
+            st.markdown(
+                f"""
+                <div class='scorecard' style='font-family: Inter, ui-sans-serif'>
+                    <div style='display: flex; align-items: center; margin-bottom: 8px'>
+                        <span style='font-size: 20px; margin-right: 8px'>{kpi['icon']}</span>
+                        <span style='font-size: 14px; font-weight: 600; color: #0f172a'>{kpi['label']}</span>
+                    </div>
+                    <div class='gauge-wrap'>
+                        <div class='gauge' style="{gauge_style}">
+                            <div class='gauge-inner' style='font-family: Inter, ui-sans-serif'>
+                                {kpi['value']:.1f}%
+                            </div>
+                        </div>
+                        <div class='meta' style='font-family: Inter, ui-sans-serif'>
+                            Target: {kpi['target']}%
+                        </div>
+                    </div>
+                </div>
+                """,
+                unsafe_allow_html=True
+            )
+    
+    st.markdown("</div>", unsafe_allow_html=True)
+    
+    # Charts Section - Full width plots using time series data
+    # Water Supply vs Consumption Chart
+    st.markdown("<div class='panel'><h3>Water Supply vs Consumption</h3>", unsafe_allow_html=True)
+    
+    # Use the filtered time series data
+    fig_supply = go.Figure()
+    fig_supply.add_trace(go.Scatter(x=time_series['date'], y=time_series['w_supplied'],
+                                  name='Water Supplied', mode='lines+markers',
+                                  line=dict(color='#0ea5e9', shape='linear')))
+    fig_supply.add_trace(go.Scatter(x=time_series['date'], y=time_series['total_consumption'],
+                                  name='Total Consumption', mode='lines+markers',
+                                  line=dict(color='#10b981', shape='linear')))
+    fig_supply.add_trace(go.Scatter(x=time_series['date'], y=time_series['metered'],
+                                  name='Metered Consumption', mode='lines+markers',
+                                  line=dict(color='#f59e0b', shape='linear')))
+    # Calculate dynamic y-axis range for supply chart
+    y_max = max(
+        time_series['w_supplied'].max(),
+        time_series['total_consumption'].max(),
+        time_series['metered'].max()
+    )
+    y_min = min(
+        time_series['w_supplied'].min(),
+        time_series['total_consumption'].min(),
+        time_series['metered'].min()
+    )
+    y_padding = (y_max - y_min) * 0.1
+    
+    fig_supply.update_layout(
+        margin=dict(l=10, r=10, t=10, b=10),
+        height=400,
+        showlegend=True,
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+        yaxis=dict(
+            range=[max(0, y_min - y_padding), y_max + y_padding],
+            title="Volume"
+        ),
+        xaxis=dict(title="Date")
+    )
+    st.plotly_chart(fig_supply, use_container_width=True, config={"displayModeBar": False})
+    st.markdown("</div>", unsafe_allow_html=True)
+    
+    # Water Quality Tests Chart
+    st.markdown("<div class='panel'><h3>Water Quality Tests</h3>", unsafe_allow_html=True)
+    fig_quality = go.Figure()
+    fig_quality.add_trace(go.Scatter(x=time_series['date'], 
+                                   y=time_series['water_quality_rate'],
+                                   name='Water Quality Rate',
+                                   mode='lines+markers',
+                                   line=dict(color='#10b981', shape='linear')))
+    target = 95
+    fig_quality.add_hline(y=target, line_dash="dot", 
+                        line_color="#ef4444",
+                        annotation_text="Target")
+    fig_quality.update_layout(
+        margin=dict(l=10, r=10, t=10, b=10),
+        height=400,
+        yaxis_range=[60, 100],
+        showlegend=True,
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
+    )
+    st.plotly_chart(fig_quality, use_container_width=True,
+                   config={"displayModeBar": False})
+    st.markdown("</div>", unsafe_allow_html=True)
 
-    st.markdown("<div class='panel'><h3>Hours & Consumption</h3>", unsafe_allow_html=True)
-    if sq:
-        dfh = pd.DataFrame({"m": sq["months"], "hours": sq["hours"], "lcd": sq.get("lcd", [])})
-        dfh = _filter_df_by_months(dfh, "m")
-        figh = go.Figure()
-        figh.add_trace(go.Scatter(x=dfh["m"], y=dfh["hours"], mode="lines", name="Hours/day", line=dict(color="#60a5fa", width=2)))
-        if len(dfh.get("lcd", [])) == len(dfh["m"]):
-            figh.add_trace(go.Scatter(x=dfh["m"], y=dfh["lcd"], mode="lines", name="l/c/d", yaxis="y2", line=dict(color="#10b981", width=2)))
-            figh.update_layout(yaxis2=dict(overlaying='y', side='right'))
-        st.plotly_chart(figh, use_container_width=True, config={"displayModeBar": False}, key="quality_hours_lcd")
-    else:
-        dfs = pd.DataFrame(COMPLAINTS_VS_INTERRUP)
-        figs = px.scatter(dfs, x="interruptions", y="complaints", hover_name="zone")
-        st.plotly_chart(figs, use_container_width=True, config={"displayModeBar": False}, key="quality_scatter")
+    # Customer Complaints Chart
+    st.markdown("<div class='panel'><h3>Customer Complaints</h3>", unsafe_allow_html=True)
+    complaint_resolution = time_series[['date', 'complaint_resolution_rate']].copy()
+    
+    fig_complaints = go.Figure()
+    fig_complaints.add_trace(go.Scatter(x=complaint_resolution['date'], 
+                                      y=complaint_resolution['complaint_resolution_rate'],
+                                      name='Resolution Rate',
+                                      mode='lines+markers',
+                                      line=dict(color='#0ea5e9', shape='linear')))
+    fig_complaints.update_layout(
+        barmode='overlay',
+        margin=dict(l=10, r=10, t=10, b=10),
+        height=400,
+        showlegend=True,
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
+    )
+    st.plotly_chart(fig_complaints, use_container_width=True, 
+                   config={"displayModeBar": False})
+    st.markdown("</div>", unsafe_allow_html=True)
+
+    # Sanitation Services Chart
+    st.markdown("<div class='panel'><h3>Sanitation Services</h3>", unsafe_allow_html=True)
+    # Use pre-calculated sewer coverage rate from time series
+    fig_sanitation = go.Figure()
+    fig_sanitation.add_trace(go.Scatter(x=time_series['date'],
+                                      y=time_series['sewer_coverage_rate'],
+                                      name='Sewer Coverage %',
+                                      mode='lines+markers',
+                                      line=dict(color='#10b981', shape='linear')))
+    fig_sanitation.add_trace(go.Bar(x=time_series['date'],
+                                  y=time_series['public_toilets'],
+                                  name='Public Toilets',
+                                  marker_color='#0ea5e9'))
+    fig_sanitation.update_layout(
+        margin=dict(l=10, r=10, t=10, b=10),
+        height=400,
+        showlegend=True,
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
+    )
+    st.plotly_chart(fig_sanitation, use_container_width=True,
+                   config={"displayModeBar": False})
     st.markdown("</div>", unsafe_allow_html=True)
 
 
