@@ -1,12 +1,23 @@
+import streamlit as st
+import pandas as pd
+import numpy as np
+import plotly.graph_objects as go
+import plotly.express as px
+import io
+from datetime import datetime
+
+
 def scene_finance():
     """
     Enhanced Financial Dashboard - Comprehensive Financial Analysis
 
     Features:
+    - Auto-load default data on page initialization
     - Import national and financial service data
     - Advanced billing, debt, and financial analysis
     - Interactive filters by country, city, date range
     - Export filtered/analyzed data
+    - Export calculated metrics to separate CSV
     - Upload custom data functionality
     """
 
@@ -72,7 +83,7 @@ def scene_finance():
     st.markdown("**Comprehensive Financial Analysis with Real Data Integration**")
 
     # ============================================================================
-    # DATA IMPORT SECTION
+    # DATA IMPORT SECTION WITH AUTO-LOADING
     # ============================================================================
 
     st.markdown('<div class="upload-section">', unsafe_allow_html=True)
@@ -83,9 +94,22 @@ def scene_finance():
         st.session_state.national_data = None
     if 'fin_service_data' not in st.session_state:
         st.session_state.fin_service_data = None
+    if 'default_data_loaded' not in st.session_state:
+        st.session_state.default_data_loaded = False
+
+    # AUTO-LOAD DEFAULT DATA ON FIRST PAGE LOAD
+    if not st.session_state.default_data_loaded:
+        try:
+            st.session_state.national_data = pd.read_csv('Master_Data_DontEdit.xlsx-all_national.csv')
+            st.session_state.fin_service_data = pd.read_csv('Master_Data_DontEdit.xlsx-all_fin_service.csv')
+            st.session_state.default_data_loaded = True
+            st.success("✅ Default data loaded automatically!")
+        except Exception as e:
+            st.warning(f"⚠️ Could not auto-load default data: {e}")
+            st.session_state.default_data_loaded = True  # Prevent repeated attempts
 
     # Tab for different import methods
-    import_tab1, import_tab2 = st.tabs(["📤 Upload Files", "📋 Use Default Data"])
+    import_tab1, import_tab2 = st.tabs(["📤 Upload Custom Files", "📋 Default Data"])
 
     with import_tab1:
         col1, col2 = st.columns(2)
@@ -93,7 +117,7 @@ def scene_finance():
         with col1:
             st.markdown("**National Budget Data**")
             national_file = st.file_uploader(
-                "Upload National Data CSV", 
+                "Upload National Data CSV",
                 type=['csv', 'xlsx'],
                 key="national_upload",
                 help="Required columns: country, city, date_YY, budget_allocated, san_allocation, wat_allocation, staff_cost, etc."
@@ -130,12 +154,11 @@ def scene_finance():
 
     with import_tab2:
         st.info("📌 Using default demonstration data (Cameroon - Yaounde)")
-        if st.button("Load Default Data"):
-            # Load default data from the provided files
+        if st.button("🔄 Reload Default Data"):
             try:
                 st.session_state.national_data = pd.read_csv('Master_Data_DontEdit.xlsx-all_national.csv')
                 st.session_state.fin_service_data = pd.read_csv('Master_Data_DontEdit.xlsx-all_fin_service.csv')
-                st.success(f"✓ Loaded {len(st.session_state.national_data)} national records and {len(st.session_state.fin_service_data)} service records")
+                st.success(f"✓ Reloaded {len(st.session_state.national_data)} national records and {len(st.session_state.fin_service_data)} service records")
             except Exception as e:
                 st.error(f"Error loading default data: {e}")
 
@@ -217,13 +240,13 @@ def scene_finance():
         fin_service_filtered = fin_service_filtered[fin_service_filtered['city'] == selected_city]
 
     national_filtered = national_filtered[
-        (national_filtered['date_YY'] >= year_range[0]) & 
+        (national_filtered['date_YY'] >= year_range[0]) &
         (national_filtered['date_YY'] <= year_range[1])
     ]
 
     if 'year' in fin_service_filtered.columns:
         fin_service_filtered = fin_service_filtered[
-            (fin_service_filtered['year'] >= year_range[0]) & 
+            (fin_service_filtered['year'] >= year_range[0]) &
             (fin_service_filtered['year'] <= year_range[1])
         ]
 
@@ -329,7 +352,7 @@ def scene_finance():
                     yaxis_title='Debt ($)',
                     hovermode='x unified',
                     height=400
-                ))
+                )
                 st.plotly_chart(fig_debt, use_container_width=True)
 
     with billing_tab2:
@@ -681,14 +704,15 @@ def scene_finance():
                 st.plotly_chart(fig_staff_cost, use_container_width=True)
 
     # ============================================================================
-    # DATA TABLE & EXPORT
+    # DATA TABLE & EXPORT SECTION
     # ============================================================================
 
     st.markdown("---")
     st.subheader("📋 Detailed Data View & Export")
 
-    export_tab1, export_tab2 = st.tabs(["📊 Financial Service Data", "🏛️ National Budget Data"])
+    export_tab1, export_tab2, export_tab3 = st.tabs(["📊 Financial Service Data", "🏛️ National Budget Data", "📈 Calculated Metrics"])
 
+    # TAB 1: Financial Service Data
     with export_tab1:
         st.markdown(f"**{len(fin_service_filtered)} records displayed**")
 
@@ -698,8 +722,8 @@ def scene_finance():
         if show_all_cols:
             display_df = fin_service_filtered
         else:
-            key_columns = ['country', 'city', 'date_MMYY', 'sewer_billed', 'sewer_revenue', 
-                          'debt', 'collection_rate', 'opex', 'cost_recovery_ratio', 
+            key_columns = ['country', 'city', 'date_MMYY', 'sewer_billed', 'sewer_revenue',
+                          'debt', 'collection_rate', 'opex', 'cost_recovery_ratio',
                           'complaints', 'resolved', 'complaint_resolution_rate']
             display_df = fin_service_filtered[[col for col in key_columns if col in fin_service_filtered.columns]]
 
@@ -741,6 +765,7 @@ def scene_finance():
                 mime="application/json"
             )
 
+    # TAB 2: National Budget Data
     with export_tab2:
         st.markdown(f"**{len(national_filtered)} records displayed**")
 
@@ -750,8 +775,8 @@ def scene_finance():
         if show_all_cols_nat:
             display_df_nat = national_filtered
         else:
-            key_columns_nat = ['country', 'city', 'date_YY', 'budget_allocated', 
-                              'san_allocation', 'wat_allocation', 'staff_cost', 
+            key_columns_nat = ['country', 'city', 'date_YY', 'budget_allocated',
+                              'san_allocation', 'wat_allocation', 'staff_cost',
                               'trained_staff', 'asset_health']
             display_df_nat = national_filtered[[col for col in key_columns_nat if col in national_filtered.columns]]
 
@@ -791,6 +816,151 @@ def scene_finance():
                 data=json_str_nat,
                 file_name=f"national_budget_data_{pd.Timestamp.now().strftime('%Y%m%d_%H%M%S')}.json",
                 mime="application/json"
+            )
+
+    # TAB 3: CALCULATED METRICS (NEW!)
+    with export_tab3:
+        st.markdown("**All calculated financial metrics in one file**")
+        st.info("📌 This file contains all derived metrics calculated from the raw data for easy analysis and reporting.")
+
+        # Create comprehensive metrics dataframe
+        metrics_data = []
+
+        # By City metrics
+        city_metrics = fin_service_filtered.groupby('city').agg({
+            'sewer_billed': ['sum', 'mean'],
+            'sewer_revenue': ['sum', 'mean'],
+            'debt': ['sum', 'mean'],
+            'collection_rate': 'mean',
+            'opex': ['sum', 'mean'],
+            'cost_recovery_ratio': 'mean',
+            'complaints': 'sum',
+            'resolved': 'sum',
+            'complaint_resolution_rate': 'mean',
+            'san_staff': 'sum',
+            'w_staff': 'sum',
+            'total_staff': 'sum',
+            'revenue_per_staff': 'mean'
+        }).reset_index()
+
+        city_metrics.columns = ['_'.join(col).strip('_') for col in city_metrics.columns.values]
+        city_metrics['metric_type'] = 'City Summary'
+
+        # By Year metrics (if available)
+        if 'year' in fin_service_filtered.columns:
+            year_metrics = fin_service_filtered.groupby('year').agg({
+                'sewer_billed': ['sum', 'mean'],
+                'sewer_revenue': ['sum', 'mean'],
+                'debt': ['sum', 'mean'],
+                'collection_rate': 'mean',
+                'opex': ['sum', 'mean'],
+                'cost_recovery_ratio': 'mean',
+                'complaints': 'sum',
+                'resolved': 'sum',
+                'complaint_resolution_rate': 'mean'
+            }).reset_index()
+
+            year_metrics.columns = ['_'.join(col).strip('_') for col in year_metrics.columns.values]
+            year_metrics['metric_type'] = 'Year Summary'
+            year_metrics = year_metrics.rename(columns={'year_': 'time_period'})
+
+        # Overall summary metrics
+        summary_metrics = pd.DataFrame({
+            'Metric': [
+                'Total Billed',
+                'Total Revenue',
+                'Total Outstanding Debt',
+                'Average Collection Rate (%)',
+                'Debt-to-Billed Ratio (%)',
+                'Total Operating Expenses',
+                'Average Cost Recovery Ratio (%)',
+                'Total Complaints',
+                'Total Resolved Complaints',
+                'Average Resolution Rate (%)',
+                'Total Staff (Sanitation)',
+                'Total Staff (Water)',
+                'Average Revenue per Staff ($)',
+                'Report Generated',
+                'Data Period'
+            ],
+            'Value': [
+                f"${total_billed:,.2f}",
+                f"${total_revenue:,.2f}",
+                f"${total_debt:,.2f}",
+                f"{avg_collection_rate:.2f}",
+                f"{debt_to_billed_ratio:.2f}",
+                f"${total_opex:,.2f}",
+                f"{fin_service_filtered['cost_recovery_ratio'].mean():.2f}",
+                f"{fin_service_filtered['complaints'].sum():,.0f}",
+                f"{fin_service_filtered['resolved'].sum():,.0f}",
+                f"{fin_service_filtered['complaint_resolution_rate'].mean():.2f}",
+                f"{fin_service_filtered['san_staff'].sum():,.0f}",
+                f"{fin_service_filtered['w_staff'].sum():,.0f}",
+                f"{fin_service_filtered['revenue_per_staff'].mean():,.2f}",
+                pd.Timestamp.now().strftime('%Y-%m-%d %H:%M:%S'),
+                f"Year {year_range[0]} to {year_range[1]}"
+            ]
+        })
+
+        # Display city metrics table
+        st.subheader("City-Level Metrics")
+        st.dataframe(city_metrics, use_container_width=True, height=300)
+
+        # Display summary metrics
+        st.subheader("Overall Summary Metrics")
+        st.dataframe(summary_metrics, use_container_width=True, height=300)
+
+        # Export calculated metrics
+        export_metric_col1, export_metric_col2, export_metric_col3 = st.columns(3)
+
+        with export_metric_col1:
+            # Combined metrics CSV
+            combined_metrics = pd.concat([
+                city_metrics.assign(metric_category='City_Level'),
+                summary_metrics.assign(metric_category='Overall_Summary')
+            ], ignore_index=True, sort=False)
+
+            csv_metrics = combined_metrics.to_csv(index=False).encode('utf-8')
+            st.download_button(
+                label="📥 Download Metrics as CSV",
+                data=csv_metrics,
+                file_name=f"calculated_metrics_{pd.Timestamp.now().strftime('%Y%m%d_%H%M%S')}.csv",
+                mime="text/csv",
+                key="download_metrics_csv"
+            )
+
+        with export_metric_col2:
+            # Excel with multiple sheets
+            buffer_metrics = io.BytesIO()
+            with pd.ExcelWriter(buffer_metrics, engine='openpyxl') as writer:
+                summary_metrics.to_excel(writer, sheet_name='Summary', index=False)
+                city_metrics.to_excel(writer, sheet_name='City_Metrics', index=False)
+                if 'year' in fin_service_filtered.columns:
+                    year_metrics.to_excel(writer, sheet_name='Year_Metrics', index=False)
+            buffer_metrics.seek(0)
+
+            st.download_button(
+                label="📥 Download Metrics as Excel",
+                data=buffer_metrics,
+                file_name=f"calculated_metrics_{pd.Timestamp.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                key="download_metrics_excel"
+            )
+
+        with export_metric_col3:
+            # JSON export
+            json_metrics = {
+                'summary': summary_metrics.to_dict('records'),
+                'city_level': city_metrics.to_dict('records'),
+                'export_timestamp': pd.Timestamp.now().isoformat()
+            }
+            json_str_metrics = pd.Series(json_metrics).to_json(indent=2)
+            st.download_button(
+                label="📥 Download Metrics as JSON",
+                data=json_str_metrics,
+                file_name=f"calculated_metrics_{pd.Timestamp.now().strftime('%Y%m%d_%H%M%S')}.json",
+                mime="application/json",
+                key="download_metrics_json"
             )
 
     # ============================================================================
